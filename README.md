@@ -145,9 +145,12 @@ near. The host runs the practice drones: all drone damage is decided there,
 drone positions are sent to the joiner, and the joiner's kills are credited
 back to them as experience. Each player keeps their own abilities and
 progress. Clones, pads, the grapple rope, recall markers and time powers
-are only seen by the player using them. On a network the host may have to
-allow the game through the firewall. The code is in `src/net.rs` (UDP,
-standard library only).
+are only seen by the player using them. When hosting, the game tries to open
+the selected UDP port on the router with UPnP and displays the public address
+if that succeeds. If automatic forwarding is unavailable, forward that UDP
+port to the host PC manually and allow the game through the firewall. UPnP
+cannot bypass carrier-grade NAT. The networking and router mapping code is in
+`src/net.rs`.
 ### Fights
 
 With two players connected, the game is a match of rounds:

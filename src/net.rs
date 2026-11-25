@@ -1,4 +1,4 @@
-//! Two-player networking over UDP (standard library only).
+//! Two-player networking over UDP.
 //!
 //! One player **hosts** (listens on a port) and the other **joins** (sends
 //! to the host's address). Each side sends its player's state about 30
@@ -10,10 +10,12 @@
 //! magic byte and protocol version, so stray traffic is ignored.
 
 use std::io::ErrorKind;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
+use igd_next::{Gateway, PortMappingProtocol, SearchOptions, search_gateway};
 
 const MAGIC: u8 = 0xB7;
 const VERSION: u8 = 2;
@@ -283,6 +285,21 @@ pub struct Net {
     hello_timer: f32,
     state_timer: f32,
     drone_timer: f32,
+    port_mapping: Arc<Mutex<PortMappingState>>,
+}
+
+enum PortMappingState {
+    Disabled,
+    Searching,
+    Mapped { gateway: Gateway, port: u16, address: String },
+    Failed,
+    Closed,
+}
+
+struct PortMapping {
+    gateway: Gateway,
+    port: u16,
+    address: String,
 }
 
 impl Net {
@@ -306,7 +323,13 @@ impl Net {
 
     fn with(socket: UdpSocket, role: Role, peer: Option<SocketAddr>) -> std::io::Result<Self> {
         socket.set_nonblocking(true)?;
-        Ok(Self {
+        let port = socket.local_addr()?.port();
+        let port_mapping = Arc::new(Mutex::new(if role == Role::Host {
+            PortMappingState::Searching
+        } else {
+            PortMappingState::Disabled
+        }));
+        let net = Self {
             socket,
             role,
             peer,
@@ -316,7 +339,35 @@ impl Net {
             hello_timer: 0.0,
             state_timer: 0.0,
             drone_timer: 0.0,
-        })
+            port_mapping: port_mapping.clone(),
+        };
+        if role == Role::Host {
+            std::thread::spawn(move || {
+                let result = map_udp_port(port);
+                let mut state = port_mapping.lock().unwrap_or_else(|e| e.into_inner());
+                match result {
+                    Ok(mapping) => match &*state {
+                        PortMappingState::Closed => {
+                            let _ = mapping.gateway.remove_port(PortMappingProtocol::UDP, mapping.port);
+                        }
+                        _ => {
+                            *state = PortMappingState::Mapped {
+                                gateway: mapping.gateway,
+                                port: mapping.port,
+                                address: mapping.address,
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        log::info!("automatic UDP port forwarding unavailable: {e}");
+                        if !matches!(&*state, PortMappingState::Closed) {
+                            *state = PortMappingState::Failed;
+                        }
+                    }
+                }
+            });
+        }
+        Ok(net)
     }
 
     pub fn port(&self) -> u16 {
@@ -329,6 +380,26 @@ impl Net {
 
     pub fn is_host(&self) -> bool {
         self.role == Role::Host
+    }
+
+    /// Public address to share when UPnP successfully forwarded this port.
+    pub fn public_address(&self) -> Option<String> {
+        let state = self.port_mapping.lock().unwrap_or_else(|e| e.into_inner());
+        match &*state {
+            PortMappingState::Mapped { address, .. } => Some(address.clone()),
+            _ => None,
+        }
+    }
+
+    /// Human-readable state for automatic router configuration.
+    pub fn port_forwarding_status(&self) -> &'static str {
+        let state = self.port_mapping.lock().unwrap_or_else(|e| e.into_inner());
+        match &*state {
+            PortMappingState::Searching => "Checking the router for automatic UDP forwarding…",
+            PortMappingState::Mapped { .. } => "The router opened the UDP port automatically.",
+            PortMappingState::Failed => "Automatic forwarding unavailable. Forward UDP manually or enable UPnP on the router.",
+            PortMappingState::Disabled | PortMappingState::Closed => "",
+        }
     }
 
     /// A line for the menu.
@@ -456,7 +527,44 @@ impl Drop for Net {
         if self.connected {
             self.send(&Msg::Bye);
         }
+        let mut state = self.port_mapping.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::mem::replace(&mut *state, PortMappingState::Closed);
+        if let PortMappingState::Mapped { gateway, port, .. } = previous {
+            if let Err(e) = gateway.remove_port(PortMappingProtocol::UDP, port) {
+                log::debug!("couldn't remove UPnP port mapping: {e}");
+            }
+        }
     }
+}
+
+fn map_udp_port(port: u16) -> Result<PortMapping, String> {
+    let mut options = SearchOptions::default();
+    options.timeout = Some(Duration::from_secs(4));
+    options.single_search_timeout = Some(Duration::from_secs(2));
+    let gateway = search_gateway(options).map_err(|e| e.to_string())?;
+
+    // Route a harmless UDP probe toward the router to learn the LAN interface
+    // address that must receive the forwarded traffic.
+    let probe = UdpSocket::bind(("0.0.0.0", 0)).map_err(|e| e.to_string())?;
+    probe.connect(gateway.addr).map_err(|e| e.to_string())?;
+    let mut local_addr = probe.local_addr().map_err(|e| e.to_string())?;
+    local_addr.set_port(port);
+
+    gateway
+        .add_port(PortMappingProtocol::UDP, port, local_addr, 0, "OzLand multiplayer")
+        .map_err(|e| e.to_string())?;
+    let external_ip = match gateway.get_external_ip() {
+        Ok(ip) => ip,
+        Err(e) => {
+            let _ = gateway.remove_port(PortMappingProtocol::UDP, port);
+            return Err(e.to_string());
+        }
+    };
+    let address = match external_ip {
+        IpAddr::V4(ip) => format!("{ip}:{port}"),
+        IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+    };
+    Ok(PortMapping { gateway, port, address })
 }
 
 /// This computer's address on the local network, to tell a friend. Found

@@ -76,8 +76,11 @@ pub struct Meters {
 pub struct NetView {
     /// Hosting or joining (connected or not).
     pub active: bool,
+    pub is_host: bool,
     pub connected: bool,
     pub status: String,
+    pub port_forwarding: String,
+    pub public_address: Option<String>,
     /// Your colour and the other player's (linear RGB).
     pub my_color: glam::Vec3,
     pub other_color: glam::Vec3,
@@ -669,6 +672,14 @@ fn multiplayer_tab(ui: &mut egui::Ui, menu: &mut MenuState, hud: &Hud) -> Option
     ui.label(RichText::new(if net.active { net.status.as_str() } else { "Playing alone" }).size(17.0).color(
         if net.connected { UNLOCKED } else if net.active { WARM } else { Color32::LIGHT_GRAY },
     ));
+    if net.active && net.is_host {
+        if let Some(address) = &net.public_address {
+            ui.label(RichText::new(format!("Give your friend: {address}")).color(ACCENT));
+        }
+        if !net.port_forwarding.is_empty() {
+            ui.label(RichText::new(&net.port_forwarding).small().weak());
+        }
+    }
     ui.add_space(4.0);
     swatch(ui, net.my_color, "Your colour");
     if net.connected {
@@ -697,7 +708,7 @@ fn multiplayer_tab(ui: &mut egui::Ui, menu: &mut MenuState, hud: &Hud) -> Option
             if let Some(ip) = &net.lan_ip {
                 ui.label(RichText::new(format!("Same Wi-Fi: {ip}:{}", menu.host_port.trim())).color(ACCENT));
             }
-            ui.label(RichText::new("Different networks: forward UDP on this port to this PC in your router, then give your public IP:port. The host firewall must allow the game.").small().weak());
+            ui.label(RichText::new("When hosting, the game tries to forward UDP automatically using UPnP. If that fails, forward UDP on this port to this PC in your router. The host firewall must allow the game.").small().weak());
 
             let ui = &mut cols[1];
             ui.label(RichText::new("Join a game").heading());

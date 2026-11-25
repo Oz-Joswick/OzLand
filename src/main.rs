@@ -1271,8 +1271,11 @@ impl Game {
             kills: self.weapons.kills,
             net: ui::NetView {
                 active: self.net.is_some(),
+                is_host: self.net.as_ref().is_some_and(|n| n.is_host()),
                 connected: self.net.as_ref().is_some_and(|n| n.connected()),
                 status: self.net.as_ref().map(|n| n.status()).unwrap_or_default(),
+                port_forwarding: self.net.as_ref().map(|n| n.port_forwarding_status().to_owned()).unwrap_or_default(),
+                public_address: self.net.as_ref().and_then(|n| n.public_address()),
                 my_color: net::PLAYER_COLORS[self.net.as_ref().map_or(0, |n| n.role.color_index())],
                 other_color: net::PLAYER_COLORS[1 - self.net.as_ref().map_or(0, |n| n.role.color_index())],
                 lan_ip: self.lan_ip.clone(),
