@@ -1,0 +1,37 @@
+name: Publish initial game release
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and publish v0.1.1
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $toml = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($toml, '(?m)^version = "([^"]+)"').Groups[1].Value
+          if (-not $version) { throw "Could not read the Cargo package version." }
+
+          gh release view "v$version" --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            .\tools\release.ps1 -Version $version -Repo $env:GITHUB_REPOSITORY
+          } else {
+            Write-Host "Release v$version already exists."
+          }
+
+          gh workflow disable publish-initial-release.yml --repo $env:GITHUB_REPOSITORY
