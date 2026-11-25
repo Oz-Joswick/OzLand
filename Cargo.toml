@@ -1,0 +1,33 @@
+git [package]
+name = "OzLand"
+version = "0.1.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.105"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = "0.37"
+egui-winit = "0.37"
+env_logger = "0.11.12"
+glam = { version = "0.34.3", features = ["bytemuck"] }
+gltf = "1.4.1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+log = "0.4.35"
+pollster = "1.0.3"
+tobj = "4.0.5"
+ureq = "3.5.2"
+wgpu = "30.0.2"
+winit = "0.30.13"
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+
+# Debug builds: optimize dependencies (image decoding, glTF parsing, wgpu) so
+# loading textured models takes a moment instead of many seconds. They are
+# compiled once and cached, so this barely affects rebuild times.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Light optimization for our own code (mipmap generation runs at startup)
+# while keeping it debuggable.
+[profile.dev]
+opt-level = 1

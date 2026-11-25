@@ -1,0 +1,5 @@
+/target
+
+# Release builds (tools/release.ps1)
+/release
+assets/.hash
