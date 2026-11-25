@@ -72,7 +72,9 @@ if ($LASTEXITCODE -ne 0) { throw "The build failed." }
 $out = "release"
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }
 New-Item -ItemType Directory $out | Out-Null
-Copy-Item target\release\untitled.exe "$out\walkabout.exe"
+$packageName = [regex]::Match($toml, '(?m)^name = "([^"]+)"').Groups[1].Value
+if (-not $packageName) { throw "Could not read the Cargo package name." }
+Copy-Item "target\release\$packageName.exe" "$out\walkabout.exe"
 
 # --- Assets hash (contents, not dates: unchanged assets aren't re-downloaded) --
 $root = (Resolve-Path assets).Path
