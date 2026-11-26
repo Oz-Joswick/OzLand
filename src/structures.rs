@@ -30,9 +30,12 @@ pub const SHOT_SCALE: f32 = 5.0;
 const MAX_BARRIERS: usize = 4;
 const MAX_CEILINGS: usize = 2;
 const MAX_DOMES: usize = 2;
-const MAX_PADS: usize = 2;
+/// Heal pads and storms: room for a Rejuvenate or Blizzard from you and
+/// four arcane clones, twice over (the Heal Pad skill keeps its own two;
+/// see `Game::build`).
+const MAX_PADS: usize = 12;
 const MAX_WELLS: usize = 2;
-const MAX_STORMS: usize = 2;
+const MAX_STORMS: usize = 12;
 const MAX_BOXES: usize = 2;
 pub const STORM_RADIUS: f32 = 12.0;
 /// A healing pad's reach and a gravity well's, at size 1.

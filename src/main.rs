@@ -227,6 +227,9 @@ const CAST_WALK_STEADY: f32 = 0.6;
 /// Whirlwind reaches only what's right beside you.
 const WHIRLWIND_REACH: f32 = 3.5;
 
+/// Heal pads from the Heal Pad skill you can have out at once.
+const SKILL_PADS: usize = 2;
+
 /// Hit-stop lengths (seconds): destroying a drone, a hard ground slam,
 /// taking a big hit. Scaled by the screen shake setting (0 turns it off).
 const HITSTOP_KILL: f32 = 0.045;
@@ -617,6 +620,8 @@ struct Game {
     rift_first: Option<net::GatePoint>,
     /// Time to the next Blizzard damage tick.
     storm_tick: f32,
+    /// Your Heal Pad skill's pads, oldest first (ids).
+    skill_pads: Vec<u32>,
     /// Drones destroyed outside the weapons this frame (Repulse), counted next frame.
     extra_kills: u32,
     /// Trials completed and healing, applied once the frame's moves are done.
@@ -860,6 +865,7 @@ impl Game {
             rift_gates: [None, None],
             rift_first: None,
             storm_tick: 0.0,
+            skill_pads: Vec::new(),
             extra_kills: 0,
             unlocked: Vec::new(),
             heal_queue: Vec::new(),
@@ -2646,7 +2652,7 @@ impl Game {
         if any {
             self.audio.play(audio::Sfx::Thunder);
             self.add_shake(0.15);
-        } else {
+        } else if self.spell_from.is_none() {
             self.notify("The lightning found nothing to strike.");
         }
     }
@@ -3336,6 +3342,17 @@ impl Game {
             scale: scale * box_scale,
             power,
         };
+        // The Heal Pad skill keeps two pads of its own out at once (the
+        // shared cap is higher, for Rejuvenate's circles).
+        if kind == Kind::HealPad {
+            let alive = self.structures.mine(Kind::HealPad, me);
+            self.skill_pads.retain(|id| alive.contains(id));
+            while self.skill_pads.len() >= SKILL_PADS {
+                let oldest = self.skill_pads.remove(0);
+                self.unbuild(oldest, false);
+            }
+            self.skill_pads.push(s.id);
+        }
         self.structures.add(s);
         if let Some(net) = self.net.as_ref().filter(|n| n.connected()) {
             net.send(&net::Msg::Build(s));

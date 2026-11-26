@@ -16,10 +16,12 @@ use crate::model::MaterialData;
 use crate::renderer::Renderer;
 use crate::terrain::Terrain;
 
-const MAX_SHOTS: usize = 96;
-const MAX_ROCKETS: usize = 16;
-const MAX_BLASTS: usize = 12;
-const MAX_BEAMS: usize = 14;
+/// Room for you and four arcane clones casting at once (5 x 28 Arcane
+/// Missiles bolts, 5 x 5 meteors plus fireballs, 5 x 13 lance beams).
+const MAX_SHOTS: usize = 192;
+const MAX_ROCKETS: usize = 48;
+const MAX_BLASTS: usize = 32;
+const MAX_BEAMS: usize = 72;
 const SHOT_LIFE: f32 = 2.5;
 /// Blasts at least this big (m) dent the ground: meteors, fireballs,
 /// cluster grenades and upgraded rockets, not ordinary rockets (6 m).
