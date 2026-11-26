@@ -21,6 +21,11 @@ pub enum Collider {
     None,
     /// The model's whole bounding box, after placement.
     Bounds,
+    /// Columns following the model's surface (rocks, boulders): a grid over
+    /// its footprint, each cell solid from the lowest to the highest point
+    /// of the model above it. No invisible walls beside a rounded or tilted
+    /// rock, and its top is where you see it.
+    Shape,
     /// A box of this size (world units) standing on the ground, centered on
     /// the model's own origin (usually its trunk/post/feet). Useful when the
     /// bounding box is much bigger than the solid part.
@@ -44,6 +49,9 @@ pub struct Placement {
     pub collider: Collider,
     /// Linear RGBA multiplied with the model's colors (for variety).
     pub tint: Vec4,
+    /// How far the model leans to follow the slope it stands on: 0 keeps it
+    /// upright (trees, posts), 1 lies it flush with the ground (rocks, logs).
+    pub tilt: f32,
 }
 
 impl Placement {
@@ -57,10 +65,11 @@ impl Placement {
             height: None,
             collider: Collider::Bounds,
             tint: Vec4::ONE,
+            tilt: 0.0,
         }
     }
-    pub fn at_height(mut self, y: f32) -> Self {
-        self.y = Some(y);
+    pub fn tilt(mut self, amount: f32) -> Self {
+        self.tilt = amount;
         self
     }
     pub fn yaw(mut self, degrees: f32) -> Self {
@@ -210,6 +219,9 @@ pub struct SceneBuilder {
     surfaces: HashMap<Surface, MeshData>,
     pub models: Vec<PlacedModel>,
     loaded: HashMap<String, Option<usize>>,
+    /// Per loaded model: points around the bottom of its mesh (relative to
+    /// its bottom-center), used to settle it onto uneven ground.
+    bases: Vec<Vec<Vec3>>,
     pub colliders: Vec<Aabb>,
 }
 
@@ -221,6 +233,7 @@ impl SceneBuilder {
             surfaces: HashMap::new(),
             models: Vec::new(),
             loaded: HashMap::new(),
+            bases: Vec::new(),
             colliders: Vec::new(),
         }
     }
@@ -437,7 +450,44 @@ impl SceneBuilder {
             .map(|v| v / 2.0);
             self.mesh(Surface::Shingles)
                 .push_quad(corners, uv, tint, dir(0.0, 1.0, side));
+
+            // Give each shingled slope real depth. The dark underside and
+            // fascia are visible from below and at the gable ends, so the
+            // roof reads as a solid timber structure instead of a sheet.
+            let normal = dir(0.0, rise, side * b).normalize_or_zero();
+            let underside = corners.map(|p| p - normal * 0.28);
+            let fascia = tint * Vec4::new(0.62, 0.58, 0.56, 1.0);
+            let plain_uv = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y];
+            self.mesh(Surface::Planks)
+                .push_quad(underside, uv, fascia, -normal);
+
+            // Eave and rake edges close the thickness of the roof panel.
+            let edge_mesh = self.mesh(Surface::Planks);
+            edge_mesh.push_quad(
+                [corners[2], corners[3], underside[3], underside[2]],
+                plain_uv,
+                fascia,
+                dir(0.0, -b, side * rise),
+            );
+            edge_mesh.push_quad(
+                [corners[0], corners[3], underside[3], underside[0]],
+                plain_uv,
+                fascia,
+                dir(-1.0, 0.0, 0.0),
+            );
+            edge_mesh.push_quad(
+                [corners[1], corners[2], underside[2], underside[1]],
+                plain_uv,
+                fascia,
+                dir(1.0, 0.0, 0.0),
+            );
         }
+        // A rounded ridge cap makes the two slopes meet with a visible
+        // three-dimensional peak and protects the seam along the top.
+        let ridge_start = if ridge_along_x { Vec3::new(center.x - a, ridge_y, center.y) } else { Vec3::new(center.x, ridge_y, center.y - a) };
+        let ridge_axis = if ridge_along_x { Vec3::X } else { Vec3::Z };
+        self.mesh(Surface::Shingles)
+            .push_cylinder(ridge_start, ridge_axis, 0.18, 2.0 * a, 8, tint * Vec4::new(0.8, 0.76, 0.72, 1.0), 1.0);
         for end in [-1.0f32, 1.0] {
             let u = end * half.x;
             let p = [
@@ -525,6 +575,7 @@ impl SceneBuilder {
             match model::load(&self.assets.join(file)) {
                 Ok(model) => {
                     log::info!("loaded {file}: {} part(s)", model.parts.len());
+                    self.bases.push(base_points(&model));
                     self.models.push(PlacedModel {
                         model,
                         instances: Vec::new(),
@@ -538,30 +589,46 @@ impl SceneBuilder {
             }
         });
         let index = index?;
-        let y = p
-            .y
-            .unwrap_or_else(|| self.ground(p.position.x, p.position.y) - 0.08);
-        let position = Vec3::new(p.position.x, y, p.position.y);
-        let placed = &mut self.models[index];
-
-        let b = placed.model.bounds;
+        let b = self.models[index].model.bounds;
         let size = b.size();
         let bottom_center = Vec3::new((b.min.x + b.max.x) * 0.5, b.min.y, (b.min.z + b.max.z) * 0.5);
         let fit = match p.height {
             Some(h) if size.y > 0.0 => h / size.y,
             _ => 1.0,
         };
-        let transform = Mat4::from_scale_rotation_translation(
-            Vec3::splat(fit * p.scale),
-            Quat::from_rotation_y(-p.yaw_degrees.to_radians()),
-            position,
-        ) * Mat4::from_translation(-bottom_center);
+        let scale = fit * p.scale;
+        let yaw = Quat::from_rotation_y(-p.yaw_degrees.to_radians());
+        let rotation = if p.tilt > 0.0 {
+            let n = self.terrain.normal_at(p.position.x, p.position.y);
+            let up = Vec3::Y.lerp(n, p.tilt.clamp(0.0, 1.0)).normalize();
+            Quat::from_rotation_arc(Vec3::Y, up) * yaw
+        } else {
+            yaw
+        };
+        // On the terrain: low enough that no part of the model's base hangs
+        // in the air on a slope, plus a little to bed it in.
+        let y = p.y.unwrap_or_else(|| {
+            let mut y = self.ground(p.position.x, p.position.y);
+            for &q in &self.bases[index] {
+                let o = rotation * (q * scale);
+                y = y.min(self.ground(p.position.x + o.x, p.position.y + o.z) - o.y);
+            }
+            y - 0.08
+        });
+        let position = Vec3::new(p.position.x, y, p.position.y);
+        let placed = &mut self.models[index];
+        let transform = Mat4::from_scale_rotation_translation(Vec3::splat(scale), rotation, position)
+            * Mat4::from_translation(-bottom_center);
         placed.instances.push(Instance { transform, tint: p.tint });
 
         match p.collider {
             Collider::None => {}
             Collider::Bounds => {
                 let boxes = fitted_boxes(&placed.model, transform);
+                self.colliders.extend(boxes);
+            }
+            Collider::Shape => {
+                let boxes = shaped_boxes(&placed.model, transform);
                 self.colliders.extend(boxes);
             }
             Collider::Box(size) => {
@@ -595,10 +662,83 @@ pub fn build() -> Scene {
     crate::map::build()
 }
 
+/// The outline of a model's base: of the vertices in its lowest tenth, the
+/// furthest out in each of 8 directions, relative to its bottom-center.
+fn base_points(model: &Model) -> Vec<Vec3> {
+    let b = model.bounds;
+    let center = Vec3::new((b.min.x + b.max.x) * 0.5, b.min.y, (b.min.z + b.max.z) * 0.5);
+    let cutoff = b.min.y + b.size().y * 0.1;
+    let mut best = [(f32::MIN, Vec3::ZERO); 8];
+    for part in &model.parts {
+        for v in &part.mesh.vertices {
+            let q = Vec3::from(v.position);
+            if q.y > cutoff {
+                continue;
+            }
+            let d = q - center;
+            for (i, slot) in best.iter_mut().enumerate() {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                let reach = d.x * a.cos() + d.z * a.sin();
+                if reach > slot.0 {
+                    *slot = (reach, d);
+                }
+            }
+        }
+    }
+    best.iter().filter(|s| s.0 > f32::MIN).map(|s| s.1).collect()
+}
+
 /// Colliders that follow a placed model's real shape. The model is cut into
 /// slices along its longest horizontal side, and each slice gets the box
 /// around its own vertices in world space. A rotated rock or a fallen log
 /// then gets a snug fit instead of one big box around the turned model.
+/// [`Collider::Shape`]: up to 5 x 5 columns over the placed model's
+/// footprint. Points are sampled across every triangle (not just its
+/// corners), so a big flat face still fills the cells it covers.
+fn shaped_boxes(model: &Model, transform: Mat4) -> Vec<Aabb> {
+    const GRID: usize = 5;
+    let triangles: usize = model.parts.iter().map(|p| p.mesh.indices.len() / 3).sum();
+    let stride = (triangles / 3000).max(1);
+    let mut points = Vec::new();
+    for part in &model.parts {
+        let world: Vec<Vec3> = part.mesh.vertices.iter().map(|v| transform.transform_point3(Vec3::from(v.position))).collect();
+        for tri in part.mesh.indices.chunks_exact(3).step_by(stride) {
+            let [a, b, c] = [world[tri[0] as usize], world[tri[1] as usize], world[tri[2] as usize]];
+            // Enough samples that no two are much more than 0.4 m apart.
+            let longest = (b - a).length().max((c - b).length()).max((a - c).length());
+            let n = ((longest / 0.4).ceil() as usize).clamp(1, 12);
+            for i in 0..=n {
+                for j in 0..=(n - i) {
+                    let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
+                    points.push(a + (b - a) * u + (c - a) * v);
+                }
+            }
+        }
+    }
+    let Some(first) = points.first().copied() else { return Vec::new() };
+    let (lo, hi) = points.iter().fold((first, first), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
+    let cell = ((hi.x - lo.x).max(hi.z - lo.z) / GRID as f32).max(0.3);
+    let (nx, nz) = (((hi.x - lo.x) / cell).ceil().max(1.0) as usize, ((hi.z - lo.z) / cell).ceil().max(1.0) as usize);
+    let mut cells: Vec<Option<(f32, f32)>> = vec![None; nx * nz];
+    for p in &points {
+        let ix = (((p.x - lo.x) / cell) as usize).min(nx - 1);
+        let iz = (((p.z - lo.z) / cell) as usize).min(nz - 1);
+        let c = cells[iz * nx + ix].get_or_insert((p.y, p.y));
+        c.0 = c.0.min(p.y);
+        c.1 = c.1.max(p.y);
+    }
+    cells
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let (bottom, top) = c?;
+            let (ix, iz) = ((i % nx) as f32, (i / nx) as f32);
+            let min = Vec3::new(lo.x + ix * cell, bottom, lo.z + iz * cell);
+            Some(Aabb { min, max: Vec3::new(min.x + cell, top, min.z + cell) })
+        })
+        .collect()
+}
+
 fn fitted_boxes(model: &Model, transform: Mat4) -> Vec<Aabb> {
     let b = model.bounds;
     let size = b.size();
@@ -646,6 +786,23 @@ mod tests {
     fn solid_at(colliders: &[Aabb], p: Vec3) -> bool {
         let probe = Aabb::from_center(p, Vec3::splat(0.02));
         colliders.iter().any(|c| c.intersects(&probe))
+    }
+
+    #[test]
+    fn rock_colliders_follow_the_rock_not_its_box() {
+        // A ball 2 m across, sitting on the ground.
+        let ball = Model {
+            parts: vec![crate::model::ModelPart { mesh: crate::drones::sphere_mesh(1.0, 10, 16), material: Default::default() }],
+            bounds: Aabb { min: Vec3::splat(-1.0), max: Vec3::splat(1.0) },
+        };
+        let at = Mat4::from_translation(Vec3::Y);
+        let shaped = shaped_boxes(&ball, at);
+        assert!(solid_at(&shaped, Vec3::new(0.0, 1.0, 0.0)), "solid inside");
+        assert!(solid_at(&shaped, Vec3::new(0.0, 1.9, 0.0)), "you stand on its top");
+        assert!(!solid_at(&shaped, Vec3::new(0.0, 2.15, 0.0)), "not above it");
+        // The corner of its bounding box is empty air beside the ball.
+        assert!(!solid_at(&shaped, Vec3::new(0.85, 1.75, 0.85)), "no invisible wall at the corner");
+        assert!(solid_at(&fitted_boxes(&ball, at), Vec3::new(0.85, 1.75, 0.85)), "(the old slices did block there)");
     }
 
     #[test]

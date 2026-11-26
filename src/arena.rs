@@ -191,12 +191,17 @@ pub fn body_distance(p: Vec3, feet: Vec3) -> f32 {
     p.distance(axis) - 0.45
 }
 
-/// Where a segment first touches a player's body, as a distance along it.
+/// How far outside a body a shot still counts as a hit: generous, so
+/// players flying, gliding and dashing around can still be tagged.
+pub const SHOT_SLACK: f32 = 0.65;
+
+/// Where a segment first touches a player's body (with [`SHOT_SLACK`]),
+/// as a distance along it.
 pub fn segment_hits_body(from: Vec3, dir: Vec3, len: f32, feet: Vec3) -> Option<f32> {
     let steps = (len / 0.2).ceil().max(1.0) as usize;
     (0..=steps)
         .map(|k| len * k as f32 / steps as f32)
-        .find(|&t| body_distance(from + dir * t, feet) <= 0.0)
+        .find(|&t| body_distance(from + dir * t, feet) <= SHOT_SLACK)
 }
 
 #[cfg(test)]

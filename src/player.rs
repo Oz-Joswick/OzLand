@@ -6,7 +6,7 @@
 //! gliding, wall running and jumping, mantling, sliding and bunny hopping,
 //! hovering, levitation and free flight, and being pulled by a grapple.
 
-use glam::Vec3;
+use glam::{Quat, Vec3};
 
 use crate::abilities::Moveset;
 use crate::collision::Aabb;
@@ -29,7 +29,15 @@ const WALL_CLIMB_SPEED: f32 = 5.5;
 const WALL_JUMP_PUSH: f32 = 7.0;
 /// Levitation rise speed and free flight speed.
 const LEVITATE_SPEED: f32 = 6.0;
-const FLY_SPEED: f32 = 14.0;
+// Free flight is deliberate travel, but should cost momentum compared with running.
+const FLY_SPEED: f32 = 44.0;
+const FLIGHT_TIME: f32 = 60.0;
+const FLIGHT_COOLDOWN: f32 = 30.0;
+/// Forgiving jumps: you can still jump this long after walking off an
+/// edge (coyote time), and a jump pressed this long before landing
+/// happens on landing (jump buffering).
+const COYOTE_TIME: f32 = 0.12;
+const JUMP_BUFFER: f32 = 0.13;
 /// A jump this soon after landing counts as a bunny hop.
 const BUNNY_HOP_WINDOW: f32 = 0.2;
 /// The grapple's top speed, and how close counts as arrived.
@@ -55,6 +63,21 @@ pub const PLAYER_HEIGHT: f32 = 1.8;
 pub const EYE_HEIGHT: f32 = 1.6;
 pub const STEP_HEIGHT: f32 = 0.55;
 
+/// Something the player did this frame, for sounds and camera effects.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Event {
+    Jump,
+    AirJump,
+    WallJump,
+    WingsOpen,
+    WingsFold,
+    Boost,
+    Slide,
+    SlamStart,
+    /// Touched down, falling at this speed (m/s).
+    Land(f32),
+}
+
 /// What the player wants to do this frame, decoupled from the key bindings.
 #[derive(Clone, Copy, Default)]
 pub struct Controls {
@@ -69,11 +92,13 @@ pub struct Controls {
     /// Where the camera looks up/down, in radians (positive = up). Steers
     /// the glide and free flight.
     pub pitch: f32,
+    /// Toggle True Flight on or off.
+    pub flight_toggle: bool,
     /// Ctrl pressed this frame: slam in the air, slide on the ground.
     pub slam: bool,
     /// Rocket boost pressed this frame (while gliding).
     pub boost: bool,
-    /// Held: hover, levitate or fly (Gravity tree).
+    /// Held for hover/levitation; True Flight uses `flight_toggle`.
     pub levitate: bool,
     /// Toggle low gravity this frame.
     pub gravity_toggle: bool,
@@ -88,6 +113,7 @@ pub struct Player {
     boosts_used: u32,
     gliding: bool,
     slamming: bool,
+    slam_power: f32,
     /// Velocity while gliding (m/s).
     flight: Vec3,
     /// Time left on the current rocket boost.
@@ -105,11 +131,25 @@ pub struct Player {
     slide_dir: Vec3,
     /// Time standing on the ground (0 while airborne).
     since_landed: f32,
+    /// Coyote time left (seconds you can still jump since leaving the
+    /// ground), and a jump press waiting for you to land.
+    coyote: f32,
+    jump_buffer: f32,
     /// Grapple point being pulled towards.
     hook: Option<Vec3>,
     flying: bool,
+    flight_left: f32,
+    flight_cooldown: f32,
     /// Hovering or levitating this frame.
     hovering: bool,
+    /// What happened this frame (cleared at the start of each update).
+    pub events: Vec<Event>,
+    /// Boxes among the colliders that are sheer (barriers, the Giant Box):
+    /// walls you can't climb, mantle or run along.
+    pub sheer: Vec<Aabb>,
+    /// Seconds left pinned to the ground (Ground Pull) and stunned.
+    pinned: f32,
+    stunned: f32,
 }
 
 impl Player {
@@ -122,6 +162,7 @@ impl Player {
             boosts_used: 0,
             gliding: false,
             slamming: false,
+            slam_power: 1.0,
             flight: Vec3::ZERO,
             rocket: 0.0,
             ground_velocity: Vec3::ZERO,
@@ -133,9 +174,17 @@ impl Player {
             slide_left: 0.0,
             slide_dir: Vec3::ZERO,
             since_landed: 0.0,
+            coyote: 0.0,
+            jump_buffer: 0.0,
             hook: None,
             flying: false,
+            flight_left: FLIGHT_TIME,
+            flight_cooldown: 0.0,
             hovering: false,
+            events: Vec::new(),
+            sheer: Vec::new(),
+            pinned: 0.0,
+            stunned: 0.0,
         }
     }
 
@@ -181,12 +230,28 @@ impl Player {
         self.momentum
     }
 
+    pub fn slam_power(&self) -> f32 {
+        self.slam_power
+    }
+
     pub fn gliding(&self) -> bool {
         self.gliding
     }
 
     pub fn hovering(&self) -> bool {
         self.hovering
+    }
+
+    pub fn flight_left(&self) -> f32 {
+        self.flight_left
+    }
+
+    pub fn flying(&self) -> bool {
+        self.flying
+    }
+
+    pub fn flight_cooldown(&self) -> f32 {
+        self.flight_cooldown
     }
 
     pub fn wall_running(&self) -> bool {
@@ -206,6 +271,65 @@ impl Player {
         self.gliding = false;
         self.slamming = false;
         self.hook = None;
+    }
+
+    /// Rift Gate travel preserves speed while turning velocity to face the
+    /// linked exit's orientation.
+    pub fn portal_teleport(&mut self, pos: Vec3, yaw_delta: f32) {
+        let rotation = Quat::from_rotation_y(yaw_delta);
+        let velocity = self.velocity();
+        self.pos = pos;
+        self.ground_velocity = rotation * Vec3::new(velocity.x, 0.0, velocity.z);
+        self.vel_y = velocity.y;
+        self.flight = rotation * velocity;
+        self.hook = None;
+    }
+
+    /// Pushed back by something outside the world's boxes (a dome's shell):
+    /// moved to `pos`, losing any speed into `normal` (the way it pushes).
+    pub fn shove(&mut self, pos: Vec3, normal: Vec3) {
+        self.pos = pos;
+        let strip = |v: &mut Vec3| {
+            let into = v.dot(normal);
+            if into < 0.0 {
+                *v -= normal * into;
+            }
+        };
+        let flat = Vec3::new(normal.x, 0.0, normal.z).normalize_or_zero();
+        let into = self.ground_velocity.dot(flat);
+        if into < 0.0 {
+            self.ground_velocity -= flat * into;
+        }
+        strip(&mut self.flight);
+        if self.vel_y * normal.y < 0.0 {
+            self.vel_y = 0.0;
+        }
+        self.hook = None;
+    }
+
+    /// Ground Pull: held on the ground for `seconds`.
+    pub fn pin(&mut self, seconds: f32) {
+        self.pinned = self.pinned.max(seconds);
+        self.gliding = false;
+        self.hook = None;
+        self.vel_y = self.vel_y.min(-25.0);
+        self.flight = Vec3::ZERO;
+    }
+
+    /// No control for `seconds`.
+    pub fn stun(&mut self, seconds: f32) {
+        self.stunned = self.stunned.max(seconds);
+    }
+
+    pub fn pinned(&self) -> bool {
+        self.pinned > 0.0
+    }
+
+    /// Dragged by an outside force (a gravity well), colliding as usual.
+    pub fn drag(&mut self, delta: Vec3, colliders: &[Aabb], terrain: &Terrain) {
+        let grounded = self.grounded;
+        self.travel(delta, colliders, terrain, 0.0);
+        self.grounded |= grounded && delta.y <= 0.0;
     }
 
     /// Thrown upwards (a bounce pad).
@@ -280,7 +404,7 @@ impl Player {
                 break;
             }
             candidate.y = candidate.y.max(terrain.height_at(candidate.x, candidate.z));
-            if colliders.iter().any(|c| c.intersects(&Self::bounds_at(candidate))) {
+            if colliders.iter().any(|c| c.intersects(&self.bounds_at(candidate))) {
                 break;
             }
             best = candidate;
@@ -311,7 +435,7 @@ impl Player {
                 break; // cliff or map edge
             }
             candidate.y = candidate.y.max(ground);
-            if colliders.iter().any(|c| c.intersects(&Self::bounds_at(candidate))) {
+            if colliders.iter().any(|c| c.intersects(&self.bounds_at(candidate))) {
                 break;
             }
             best = candidate;
@@ -326,22 +450,30 @@ impl Player {
         self.pos + Vec3::new(0.0, EYE_HEIGHT, 0.0)
     }
 
-    fn bounds_at(pos: Vec3) -> Aabb {
+    fn bounds_at(&self, pos: Vec3) -> Aabb {
+        // A fixed size: a hitbox that grows with speed suddenly overlaps
+        // walls you are beside and pops you up onto them.
         Aabb {
             min: Vec3::new(pos.x - PLAYER_RADIUS, pos.y, pos.z - PLAYER_RADIUS),
             max: Vec3::new(pos.x + PLAYER_RADIUS, pos.y + PLAYER_HEIGHT, pos.z + PLAYER_RADIUS),
         }
     }
 
+    /// One of the sheer boxes (built structures): no stepping, mantling,
+    /// wall running or climbing on it.
+    fn is_sheer(&self, c: &Aabb) -> bool {
+        self.sheer.iter().any(|s| s.min == c.min && s.max == c.max)
+    }
+
     /// The wall right beside you, if any, as the direction pointing away
     /// from it. Only things taller than a step count.
     fn touching_wall(&self, colliders: &[Aabb]) -> Option<Vec3> {
         for dir in [Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z] {
-            let mut probe = Self::bounds_at(self.pos + dir * 0.1);
+            let mut probe = self.bounds_at(self.pos + dir * 0.1);
             probe.min.y += 0.3; // not the floor
             if colliders
                 .iter()
-                .any(|c| c.intersects(&probe) && c.max.y > self.pos.y + 0.6)
+                .any(|c| c.intersects(&probe) && c.max.y > self.pos.y + 0.6 && !self.is_sheer(c))
             {
                 return Some(-dir);
             }
@@ -365,9 +497,6 @@ impl Player {
         }
         // Deep water: you can't wade further in, but you can always head
         // back towards the shore.
-        if there < terrain.water_level - MAX_WADE_DEPTH && there < here {
-            return true;
-        }
         let run = Vec3::new(target.x - self.pos.x, 0.0, target.z - self.pos.z).length();
         self.grounded && there - here > run * MAX_SLOPE
     }
@@ -379,7 +508,7 @@ impl Player {
         if self.terrain_blocks(target, terrain) {
             return;
         }
-        let bounds = Self::bounds_at(target);
+        let bounds = self.bounds_at(target);
         let blocking: Vec<&Aabb> = colliders.iter().filter(|c| c.intersects(&bounds)).collect();
         if blocking.is_empty() {
             self.pos = target;
@@ -387,11 +516,12 @@ impl Player {
         }
 
         let climb = if self.grounded { STEP_HEIGHT } else { 0.0 }.max(reach);
-        if climb > 0.0 {
+        // Sheer walls (barriers, boxes) can't be stepped or mantled onto.
+        if climb > 0.0 && !blocking.iter().any(|c| self.is_sheer(c)) {
             let top = blocking.iter().map(|c| c.max.y).fold(f32::MIN, f32::max);
             if top - self.pos.y <= climb {
                 let stepped = Vec3::new(target.x, top, target.z);
-                let stepped_bounds = Self::bounds_at(stepped);
+                let stepped_bounds = self.bounds_at(stepped);
                 if !colliders.iter().any(|c| c.intersects(&stepped_bounds)) {
                     if top - self.pos.y > STEP_HEIGHT {
                         self.vel_y = self.vel_y.max(0.0); // mantled up
@@ -433,7 +563,7 @@ impl Player {
 
             self.pos.y += step.y;
             self.grounded = false;
-            let bounds = Self::bounds_at(self.pos);
+            let bounds = self.bounds_at(self.pos);
             let hits: Vec<&Aabb> = colliders.iter().filter(|c| c.intersects(&bounds)).collect();
             if !hits.is_empty() {
                 if step.y <= 0.0 {
@@ -456,8 +586,59 @@ impl Player {
     }
 
     /// `yaw` is the camera's heading; movement is relative to it. Returns
-    /// true on the frame a ground slam hits the ground.
+    /// true on the frame a ground slam hits the ground. What else happened
+    /// is left in `events`.
     pub fn update(
+        &mut self,
+        dt: f32,
+        controls: &Controls,
+        yaw: f32,
+        colliders: &[Aabb],
+        terrain: &Terrain,
+        moves: &Moveset,
+    ) -> bool {
+        self.events.clear();
+        if self.flight_cooldown > 0.0 {
+            self.flight_cooldown = (self.flight_cooldown - dt).max(0.0);
+            if self.flight_cooldown == 0.0 {
+                self.flight_left = FLIGHT_TIME;
+            }
+        }
+        // Pinned: dragged down, no jumping, flying or gliding. Stunned: no
+        // control at all.
+        self.pinned = (self.pinned - dt).max(0.0);
+        self.stunned = (self.stunned - dt).max(0.0);
+        let mut held = *controls;
+        if self.stunned > 0.0 {
+            held = Controls { pitch: controls.pitch, ..Default::default() };
+        }
+        if self.pinned > 0.0 {
+            held.jump = false;
+            held.levitate = false;
+            held.boost = false;
+            self.gliding = false;
+            self.hook = None;
+            if !self.grounded {
+                self.vel_y = self.vel_y.min(-25.0);
+            }
+        }
+        let controls = &held;
+        let (was_grounded, was_gliding, was_sliding) = (self.grounded, self.gliding, self.slide_left > 0.0);
+        let fall = -self.velocity().y;
+        let slammed = self.step(dt, controls, yaw, colliders, terrain, moves);
+        if self.grounded && !was_grounded {
+            self.events.push(Event::Land(fall.max(0.0)));
+        }
+        if self.gliding != was_gliding && !self.grounded {
+            self.events.push(if self.gliding { Event::WingsOpen } else { Event::WingsFold });
+        }
+        if self.slide_left > 0.5 && !was_sliding {
+            self.events.push(Event::Slide);
+        }
+        slammed
+    }
+
+    fn step(
         &mut self,
         dt: f32,
         controls: &Controls,
@@ -470,7 +651,16 @@ impl Player {
         let forward = Vec3::new(yaw.cos(), 0.0, yaw.sin());
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let wish = (forward * controls.forward + right * controls.right).normalize_or_zero();
+        let swimming = terrain.height_at(self.pos.x, self.pos.z) < terrain.water_level - MAX_WADE_DEPTH
+            && self.pos.y < terrain.water_level + 0.8;
 
+        if self.grounded {
+            self.coyote = COYOTE_TIME;
+        } else {
+            self.coyote = (self.coyote - dt).max(0.0);
+        }
+        // Just walked off an edge: Space still jumps from the ground.
+        let coyote_jump = !self.grounded && self.coyote > 0.0 && self.vel_y <= 0.5 && !self.slamming;
         if self.grounded {
             self.since_landed += dt;
             self.hover_left = moves.hover_time;
@@ -485,14 +675,28 @@ impl Player {
             self.low_gravity = !self.low_gravity;
         }
         self.low_gravity &= moves.low_gravity;
-        let gravity = GRAVITY * if self.low_gravity { LOW_GRAVITY } else { 1.0 };
+        let gravity = GRAVITY * if swimming { 0.18 } else if self.low_gravity { LOW_GRAVITY } else { 1.0 };
 
-        // True Flight: fly wherever you look while the button is held.
-        self.flying = moves.free_flight && controls.levitate && self.hook.is_none();
+        // True Flight toggles: releasing the bind leaves flight active.
+        if moves.free_flight && controls.flight_toggle && self.hook.is_none() && self.pinned <= 0.0 && self.stunned <= 0.0 {
+            if self.flying {
+                self.flying = false;
+                if self.flight_left < FLIGHT_TIME {
+                    self.flight_cooldown = FLIGHT_COOLDOWN;
+                }
+            } else if self.flight_left > 0.0 && self.flight_cooldown <= 0.0 {
+                self.flying = true;
+            }
+        }
         if self.flying {
             self.gliding = false;
             self.slamming = false;
             self.fly(dt, controls, yaw, colliders, terrain, moves);
+            self.flight_left = (self.flight_left - dt).max(0.0);
+            if self.flight_left == 0.0 {
+                self.flying = false;
+                self.flight_cooldown = FLIGHT_COOLDOWN;
+            }
             return self.land();
         }
 
@@ -500,12 +704,13 @@ impl Player {
 
         // Space in mid-air: a wall jump, or spread/fold the wings.
         let mut jump_used = false;
-        if controls.jump && !self.grounded && !self.slamming {
+        if controls.jump && !self.grounded && !self.slamming && !coyote_jump {
             if let Some(away) = wall.filter(|_| moves.wall_jump && !self.gliding) {
                 let along = self.ground_velocity - away * self.ground_velocity.dot(away);
                 self.ground_velocity = along + away * WALL_JUMP_PUSH * moves.speed.max(1.0) * moves.wall_jump_power;
                 self.vel_y = JUMP_SPEED * moves.jump * moves.wall_jump_power.sqrt();
                 jump_used = true;
+                self.events.push(Event::WallJump);
             } else if self.gliding {
                 self.gliding = false;
                 self.vel_y = self.flight.y;
@@ -525,6 +730,7 @@ impl Player {
             if controls.boost && self.boosts_used < moves.boosts {
                 self.rocket = ROCKET_TIME;
                 self.boosts_used += 1;
+                self.events.push(Event::Boost);
             }
             self.glide(dt, controls, yaw, colliders, terrain, moves);
             return self.land();
@@ -532,6 +738,17 @@ impl Player {
 
         // Momentum: slides, run-ups and bunny hops build a speed multiplier.
         let mut speed = MOVE_SPEED * moves.speed;
+        if swimming {
+            speed *= 0.58;
+            self.ground_velocity *= (-1.8 * dt).exp();
+            if controls.jump {
+                self.vel_y = self.vel_y.max(3.0);
+            } else if controls.slam {
+                self.vel_y = -2.5;
+            } else if self.pos.y < terrain.water_level - 0.55 {
+                self.vel_y = self.vel_y.max(1.0);
+            }
+        }
         if controls.sprint {
             speed *= SPRINT_MULTIPLIER;
         }
@@ -546,10 +763,10 @@ impl Player {
                 self.slide_left -= dt;
             } else if moves.run_up && controls.sprint && wish != Vec3::ZERO {
                 if self.momentum < moves.run_up_cap {
-                    self.momentum = (self.momentum + 0.35 * dt).min(moves.run_up_cap);
+                    self.momentum = (self.momentum + 0.2 * dt).min(moves.run_up_cap);
                 }
             } else if self.since_landed > BUNNY_HOP_WINDOW && !(moves.momentum_hold && wish != Vec3::ZERO) {
-                self.momentum = 1.0 + (self.momentum - 1.0) * (-1.5 * dt).exp();
+                self.momentum = 1.0 + (self.momentum - 1.0) * (-2.5 * dt).exp();
             }
         }
         self.momentum = self.momentum.clamp(1.0, moves.momentum_cap.max(1.0));
@@ -571,22 +788,34 @@ impl Player {
 
         // Jumps: from the ground (a bunny hop if just landed), or extra
         // ones in mid-air.
-        if controls.jump && !jump_used {
-            if self.grounded {
-                self.vel_y = JUMP_SPEED * moves.jump;
-                if moves.bunny_hop && self.since_landed < BUNNY_HOP_WINDOW {
-                    self.momentum = (self.momentum * 1.12).min(moves.momentum_cap);
-                }
-                self.slide_left = 0.0;
-            } else if self.air_jumps_used < moves.air_jumps && !self.slamming {
-                self.vel_y = JUMP_SPEED * moves.jump;
-                self.air_jumps_used += 1;
+        // A press just before landing still counts once you touch down.
+        let pressed = controls.jump && !jump_used;
+        let buffered = !controls.jump && self.jump_buffer > 0.0;
+        self.jump_buffer = (self.jump_buffer - dt).max(0.0);
+        if (pressed || buffered) && (self.grounded || coyote_jump) {
+            self.events.push(Event::Jump);
+            self.vel_y = JUMP_SPEED * moves.jump;
+            if moves.bunny_hop && self.grounded && self.since_landed < BUNNY_HOP_WINDOW {
+                self.momentum = (self.momentum * 1.08).min(moves.momentum_cap);
             }
+            self.slide_left = 0.0;
+            self.coyote = 0.0;
+            self.jump_buffer = 0.0;
+            self.grounded = false;
+        } else if pressed && self.air_jumps_used < moves.air_jumps && !self.slamming {
+            self.vel_y = JUMP_SPEED * moves.jump;
+            self.air_jumps_used += 1;
+            self.events.push(Event::AirJump);
+        } else if pressed && !self.grounded {
+            self.jump_buffer = JUMP_BUFFER;
         }
         // Ground slam: straight down, fast.
-        if controls.slam && moves.slam && !self.grounded && !self.slamming && self.hook.is_none() {
+        if controls.slam && moves.slam && !swimming && !self.grounded && !self.slamming && self.hook.is_none() {
             self.slamming = true;
-            self.vel_y = -SLAM_SPEED;
+            let descent = (-self.vel_y).max(0.0);
+            self.slam_power = (1.0 + descent / 60.0).clamp(1.0, 2.5);
+            self.vel_y = -SLAM_SPEED - descent * 0.35;
+            self.events.push(Event::SlamStart);
             velocity = Vec3::ZERO;
         }
 
@@ -628,7 +857,9 @@ impl Player {
                     self.vel_y = -WALL_SLIDE_SPEED;
                 }
             }
-            if controls.levitate && moves.hover_time > 0.0 && self.hover_left > 0.0 {
+            if controls.levitate && moves.hover_time > 0.0 && self.hover_left > 0.0
+                && (!moves.free_flight || self.flight_cooldown <= 0.0)
+            {
                 self.vel_y = if moves.levitate { LEVITATE_SPEED } else { 0.0 };
                 self.hover_left -= dt;
                 self.hovering = true;
@@ -640,6 +871,14 @@ impl Player {
         let blocked = self.travel(velocity * dt + Vec3::Y * self.vel_y * dt, colliders, terrain, reach);
         velocity *= Vec3::ONE - blocked; // stopped by a wall
         self.ground_velocity = velocity;
+        if !controls.slam
+            && terrain.height_at(self.pos.x, self.pos.z) < terrain.water_level - MAX_WADE_DEPTH
+            && self.pos.y < terrain.water_level - 0.45
+        {
+            self.pos.y = terrain.water_level - 0.45;
+            self.vel_y = self.vel_y.max(0.0);
+            self.grounded = false;
+        }
 
         // Downhill Surf: sliding down a slope speeds you up and keeps the
         // slide going.
@@ -671,8 +910,9 @@ impl Player {
     fn fly(&mut self, dt: f32, controls: &Controls, yaw: f32, colliders: &[Aabb], terrain: &Terrain, moves: &Moveset) {
         let look = Vec3::new(yaw.cos() * controls.pitch.cos(), controls.pitch.sin(), yaw.sin() * controls.pitch.cos());
         let right = Vec3::new(-yaw.sin(), 0.0, yaw.cos());
-        let boost = if controls.sprint { 2.0 } else { 1.0 };
-        let v = (look * controls.forward + right * controls.right).normalize_or_zero() * FLY_SPEED * moves.speed * moves.fly_speed * boost;
+        let boost = 1.0;
+        self.ground_velocity *= (-2.5 * dt).exp();
+        let v = (look * controls.forward + right * controls.right).normalize_or_zero() * FLY_SPEED * moves.fly_speed * boost;
         self.vel_y = v.y;
         let blocked = self.travel(v * dt, colliders, terrain, 0.0);
         self.ground_velocity = Vec3::new(v.x, 0.0, v.z) * (Vec3::ONE - blocked);
@@ -732,7 +972,7 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abilities::{TREES, Tree};
+    use crate::abilities::Progress;
 
     const DT: f32 = 1.0 / 60.0;
     const WALK_EAST: Controls = Controls {
@@ -741,16 +981,18 @@ mod tests {
         sprint: false,
         jump: false,
         pitch: 0.0,
+        flight_toggle: false,
         slam: false,
         boost: false,
         levitate: false,
         gravity_toggle: false,
     };
 
-    fn with(tree: Tree, level: u32) -> Moveset {
-        let mut levels = [0; TREES];
-        levels[tree.index()] = level;
-        Moveset::from_levels(levels)
+    /// The abilities an old-style tree level gave (converted to skills and
+    /// items the way old saves are).
+    fn with(tree: &str, level: u32) -> Moveset {
+        let p = Progress::parse(&format!("{tree} = {level}\n"));
+        Moveset::build(&p.equipped_ranks(), p.items(), 0)
     }
 
     fn ground_box(x: f32, size: Vec3) -> Aabb {
@@ -785,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn cliffs_and_deep_water_block() {
+    fn cliffs_block_and_deep_water_is_swum() {
         let cliff = Terrain::from_fn(50.0, 1.0, -100.0, |x, _| if x > 5.0 { (x - 5.0) * 3.0 } else { 0.0 });
         let mut p = Player::new(Vec3::ZERO);
         walk_on(&mut p, &WALK_EAST, 120, &[], &cliff);
@@ -794,7 +1036,9 @@ mod tests {
         let lake = Terrain::from_fn(50.0, 1.0, 0.0, |x, _| if x > 5.0 { -2.0 } else { 0.5 });
         let mut p = Player::new(Vec3::new(0.0, 0.5, 0.0));
         walk_on(&mut p, &WALK_EAST, 120, &[], &lake);
-        assert!(p.pos.x < 6.0, "walked into deep water: {:?}", p.pos);
+        // Deep water is swum, not walked: you float near the surface
+        // instead of sinking to the bottom.
+        assert!(p.pos.x > 6.0 && p.pos.y > -1.0, "should swim out, afloat: {:?}", p.pos);
     }
 
     #[test]
@@ -854,9 +1098,9 @@ mod tests {
     #[test]
     fn high_jump_and_double_jump_go_higher() {
         let base = apex(&Moveset::default(), false);
-        let high = with(Tree::Air, 1);
+        let high = with("air", 1);
         assert!(apex(&high, false) > base * 1.5, "high jump");
-        let double = with(Tree::Air, 2);
+        let double = with("air", 2);
         assert!(apex(&double, true) > apex(&double, false) + 0.5, "double jump");
         // Without the ability a mid-air jump does nothing.
         assert!((apex(&Moveset::default(), true) - base).abs() < 1e-3);
@@ -864,7 +1108,7 @@ mod tests {
 
     #[test]
     fn gliding_falls_slowly_and_slam_lands_hard() {
-        let glide = with(Tree::Air, 4);
+        let glide = with("air", 4);
         let spread = Controls { jump: true, ..Default::default() };
         let level = Controls::default();
         let mut p = Player::new(Vec3::new(0.0, 40.0, 0.0));
@@ -923,28 +1167,28 @@ mod tests {
     fn wall_slide_jump_and_run() {
         let wall = long_wall();
         // Slide: falling beside the wall is slow.
-        let slide = with(Tree::Parkour, 1);
+        let slide = with("parkour", 1);
         let mut p = Player::new(Vec3::new(0.0, 8.0, 0.96));
         p.grounded = false;
         run(&mut p, &Controls::default(), 30, &wall, &slide);
         assert!(p.vel_y >= -WALL_SLIDE_SPEED - 1e-3, "sliding at {}", p.vel_y);
 
         // Jump: kicks away from the wall (towards -Z) and up.
-        let jump = with(Tree::Parkour, 2);
+        let jump = with("parkour", 2);
         let mut p = Player::new(Vec3::new(0.0, 8.0, 0.96));
         p.grounded = false;
         run(&mut p, &Controls { jump: true, ..Default::default() }, 1, &wall, &jump);
         assert!(p.vel_y > 5.0 && p.ground_velocity.z < -5.0, "{:?} {}", p.ground_velocity, p.vel_y);
 
         // Run: sprinting along it in mid-air, you don't fall.
-        let wall_run = with(Tree::Parkour, 3);
+        let wall_run = with("parkour", 3);
         let mut p = Player::new(Vec3::new(0.0, 8.0, 0.96));
         p.grounded = false;
         p.refill(&wall_run); // as if just jumped from the ground
         let along = Controls { forward: 1.0, sprint: true, ..Default::default() };
         run(&mut p, &along, 60, &wall, &wall_run);
         assert!(p.pos.y > 7.5 && p.pos.x > 5.0, "{:?}", p.pos);
-        run(&mut p, &along, 60, &wall, &wall_run); // 1.5 s limit runs out
+        run(&mut p, &along, 120, &wall, &wall_run); // 1.5 s (+1 s from Grip Gloves) runs out
         assert!(p.pos.y < 7.0, "wall run should end: {:?}", p.pos);
     }
 
@@ -952,7 +1196,7 @@ mod tests {
     fn mantle_climbs_high_ledges() {
         let ledge = [ground_box(2.0, Vec3::new(2.0, 2.2, 4.0))];
         let mut p = Player::new(Vec3::ZERO);
-        run(&mut p, &WALK_EAST, 25, &ledge, &with(Tree::Parkour, 4)); // 2 m: on top
+        run(&mut p, &WALK_EAST, 25, &ledge, &with("parkour", 4)); // 2 m: on top
         assert!((p.pos.y - 2.2).abs() < 1e-3, "should be up on the ledge: {:?}", p.pos);
     }
 
@@ -961,14 +1205,31 @@ mod tests {
         let wall = [ground_box(3.0, Vec3::new(1.0, 12.0, 10.0))];
         let mut p = Player::new(Vec3::ZERO);
         let into = Controls { sprint: true, ..WALK_EAST };
-        run(&mut p, &Controls { jump: true, ..into }, 1, &wall, &with(Tree::Parkour, 5));
-        run(&mut p, &into, 60, &wall, &with(Tree::Parkour, 5));
+        run(&mut p, &Controls { jump: true, ..into }, 1, &wall, &with("parkour", 5));
+        run(&mut p, &into, 60, &wall, &with("parkour", 5));
         assert!(p.pos.y > 5.0, "should climb the wall: {:?}", p.pos);
     }
 
     #[test]
+    fn sheer_walls_cant_be_climbed_mantled_or_stepped_onto() {
+        // A low built wall you could normally step or mantle onto, and a
+        // tall one Spider God would normally climb: both sheer.
+        let spider = with("parkour", 5); // mantle 20 m, wall climb
+        for wall in [ground_box(3.0, Vec3::new(1.0, 0.4, 10.0)), ground_box(3.0, Vec3::new(1.0, 12.0, 10.0))] {
+            let mut p = Player::new(Vec3::ZERO);
+            p.sheer = vec![wall];
+            let into = Controls { sprint: true, ..WALK_EAST };
+            if wall.max.y > 5.0 {
+                run(&mut p, &Controls { jump: true, ..into }, 1, &[wall], &spider);
+            }
+            run(&mut p, &into, 120, &[wall], &spider);
+            assert!(p.pos.x < 2.5, "got onto or past a sheer wall: {:?}", p.pos);
+        }
+    }
+
+    #[test]
     fn slides_and_bunny_hops_build_speed() {
-        let moves = with(Tree::Momentum, 2);
+        let moves = with("momentum", 2);
         let mut p = Player::new(Vec3::new(-60.0, 0.0, 0.0));
         let sprint = Controls { sprint: true, ..WALK_EAST };
         run(&mut p, &sprint, 30, &[], &moves);
@@ -990,25 +1251,56 @@ mod tests {
         let mut p = Player::new(Vec3::new(0.0, 10.0, 0.0));
         p.grounded = false;
         let hold = Controls { levitate: true, ..Default::default() };
-        p.refill(&with(Tree::Gravity, 2)); // as if just jumped from the ground
-        run(&mut p, &hold, 60, &[], &with(Tree::Gravity, 2));
+        p.refill(&with("gravity", 2)); // as if just jumped from the ground
+        run(&mut p, &hold, 60, &[], &with("gravity", 2));
         assert!(p.pos.y > 9.5, "hovering: {}", p.pos.y);
 
         let mut p = Player::new(Vec3::ZERO);
-        let moves = with(Tree::Gravity, 3);
+        let moves = with("gravity", 3);
         run(&mut p, &Controls { jump: true, ..hold }, 1, &[], &moves);
         run(&mut p, &hold, 60, &[], &moves);
         assert!(p.pos.y > 6.0, "levitating: {}", p.pos.y);
 
         let mut p = Player::new(Vec3::ZERO);
-        let up = Controls { levitate: true, forward: 1.0, pitch: 0.8, ..Default::default() };
-        run(&mut p, &up, 60, &[], &with(Tree::Gravity, 5));
+        let up = Controls { forward: 1.0, pitch: 0.8, ..Default::default() };
+        let moves = with("gravity", 5);
+        run(&mut p, &Controls { flight_toggle: true, ..up }, 1, &[], &moves); // True Flight toggles on
+        run(&mut p, &up, 60, &[], &moves);
         assert!(p.pos.y > 8.0 && p.pos.x > 8.0, "flying: {:?}", p.pos);
     }
 
     #[test]
+    fn jumps_forgive_a_late_or_early_press() {
+        let moves = Moveset::default();
+        let jump = Controls { jump: true, ..Default::default() };
+        let idle = Controls::default();
+        // Coyote time: walked off a crate edge a moment ago, still jumps.
+        let mut p = Player::new(Vec3::new(0.0, 3.0, 0.0));
+        p.grounded = false;
+        p.coyote = 0.08;
+        run(&mut p, &jump, 1, &[], &moves);
+        assert!(p.vel_y > 0.0 && p.events.contains(&Event::Jump), "a ground jump just after leaving the edge");
+        // Too late: no jump (and no air jumps to fall back on).
+        let mut p = Player::new(Vec3::new(0.0, 3.0, 0.0));
+        p.grounded = false;
+        run(&mut p, &jump, 1, &[], &moves);
+        assert!(p.vel_y <= 0.0);
+        // Buffered: pressed just before landing, it jumps on landing.
+        let mut p = Player::new(Vec3::new(0.0, 0.4, 0.0));
+        p.grounded = false;
+        p.vel_y = -6.0;
+        run(&mut p, &jump, 1, &[], &moves);
+        let mut jumped = false;
+        for _ in 0..8 {
+            run(&mut p, &idle, 1, &[], &moves);
+            jumped |= p.events.contains(&Event::Jump);
+        }
+        assert!(jumped, "the early press jumped on landing");
+    }
+
+    #[test]
     fn low_gravity_jumps_higher() {
-        let moves = with(Tree::Gravity, 1);
+        let moves = with("gravity", 1);
         let mut p = Player::new(Vec3::ZERO);
         run(&mut p, &Controls { gravity_toggle: true, ..Default::default() }, 1, &[], &moves);
         assert!(p.low_gravity());
@@ -1024,7 +1316,7 @@ mod tests {
 
     #[test]
     fn grapple_pulls_to_the_hook_and_slingshot_flings() {
-        let moves = with(Tree::Gadgets, 5);
+        let moves = with("gadgets", 5);
         let mut p = Player::new(Vec3::ZERO);
         let hook = Vec3::new(20.0, 10.0, 0.0);
         p.set_hook(hook);

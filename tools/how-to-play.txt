@@ -1,0 +1,40 @@
+OzLand
+======
+
+Start: double-click OzLand.exe (keep the assets folder next to it).
+Windows may warn about an unknown app: More info > Run anyway.
+
+Controls
+  WASD / mouse   move / look          Space   jump (again in the air: double jump, wings)
+  Shift          sprint               Ctrl    slam (air) / slide (running)
+  Left mouse     fire                 1-4     choose weapon
+  F              dash                 E       grapple (hold)
+  V              third person         Esc     menu: abilities, items, multiplayer, settings
+
+Skill crystals and drones give skill points, XP and scrap. Spend them in Esc.
+
+Playing together through Steam (easiest: works from anywhere, no setup)
+  Have Steam running before you start the game.
+  Host:  Esc > Multiplayer > Host through Steam (then Invite friends, if you like).
+  Join:  with the game open, right-click the host in your Steam friends list
+         > Join Game (or accept their invite).
+  Steam shows the game as "Spacewar": that's Steam's free test app we use.
+
+Playing together directly (same Wi-Fi, or without Steam)
+  Host:  Esc > Multiplayer > Host. Send your friend the JOIN CODE (Copy button).
+  Join:  Esc > Multiplayer > paste the code > Join.
+  When Windows Firewall asks, allow OzLand (tick private AND public networks).
+
+  Rounds: 15 s exploring from a random spot, then fight until one player falls.
+  The score is at the top of the screen.
+
+  If your friend can't connect from another house:
+   - the host's line under the code says whether the router let the game in;
+   - if not: turn on UPnP in the host's router settings, or forward UDP port 7777
+     to the host's PC;
+   - or (works everywhere): both install Tailscale (free, tailscale.com), join the
+     same Tailscale network, and the joiner types the host's Tailscale address,
+     like 100.101.102.103:7777.
+
+Updates install themselves: when one is downloaded, the game says so;
+restart it (Esc > Multiplayer > Restart now). Both players need the same version.

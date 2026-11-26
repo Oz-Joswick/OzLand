@@ -43,6 +43,26 @@ pub struct Settings {
     pub sun_elevation: f32,
     pub sun_azimuth: f32,
     pub wind: f32,
+
+    // Audio (0..1 each)
+    pub master_volume: f32,
+    pub sfx_volume: f32,
+    pub music_volume: f32,
+    pub ambient_volume: f32,
+
+    // Comfort
+    /// Camera bob while walking, and a dip on landing.
+    pub head_bob: bool,
+    /// The view widens a little at high speed.
+    pub speed_fov: bool,
+    /// Strength of camera shake (slams, blasts, hits).
+    pub screen_shake: f32,
+    /// Drones: 0 peaceful (they never shoot), 1 normal, 2 hard.
+    pub difficulty: f32,
+    /// The first-time controls card has been dismissed.
+    pub seen_intro: bool,
+    /// Skill keys you changed: skill id -> key or button id ("dash" -> "KeyR").
+    pub binds: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -64,6 +84,16 @@ impl Default for Settings {
             sun_elevation: 38.0,
             sun_azimuth: 226.0,
             wind: 0.35,
+            master_volume: 0.8,
+            sfx_volume: 0.8,
+            music_volume: 0.45,
+            ambient_volume: 0.7,
+            head_bob: true,
+            speed_fov: true,
+            screen_shake: 1.0,
+            difficulty: 1.0,
+            seen_intro: false,
+            binds: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -80,6 +110,9 @@ pub mod range {
     pub const SUN_ELEVATION: RangeInclusive<f32> = 5.0..=85.0;
     pub const SUN_AZIMUTH: RangeInclusive<f32> = 0.0..=360.0;
     pub const WIND: RangeInclusive<f32> = 0.0..=1.0;
+    pub const VOLUME: RangeInclusive<f32> = 0.0..=1.0;
+    pub const SCREEN_SHAKE: RangeInclusive<f32> = 0.0..=1.5;
+    pub const DIFFICULTY: RangeInclusive<f32> = 0.0..=2.0;
     pub const SANDBOX_ASCENSION: RangeInclusive<f32> = 0.0..=60.0;
 }
 
@@ -127,8 +160,8 @@ impl Settings {
     }
 
     pub fn serialize(&self) -> String {
-        format!(
-            "# 3D Walkabout settings\n\
+        let mut out = format!(
+            "# OzLand settings\n\
              version = {}\n\
              mouse_sensitivity = {}\n\
              invert_y = {}\n\
@@ -145,7 +178,16 @@ impl Settings {
              brightness = {}\n\
              sun_elevation = {}\n\
              sun_azimuth = {}\n\
-             wind = {}\n",
+             wind = {}\n\
+             master_volume = {}\n\
+             sfx_volume = {}\n\
+             music_volume = {}\n\
+             ambient_volume = {}\n\
+             head_bob = {}\n\
+             speed_fov = {}\n\
+             screen_shake = {}\n\
+             difficulty = {}\n\
+             seen_intro = {}\n",
             SETTINGS_VERSION,
             self.mouse_sensitivity,
             self.invert_y,
@@ -163,7 +205,20 @@ impl Settings {
             self.sun_elevation,
             self.sun_azimuth,
             self.wind,
-        )
+            self.master_volume,
+            self.sfx_volume,
+            self.music_volume,
+            self.ambient_volume,
+            self.head_bob,
+            self.speed_fov,
+            self.screen_shake,
+            self.difficulty,
+            self.seen_intro,
+        );
+        for (skill, bind) in &self.binds {
+            out += &format!("bind_{skill} = {bind}\n");
+        }
+        out
     }
 
     pub fn parse(text: &str) -> Self {
@@ -204,7 +259,20 @@ impl Settings {
                 "sun_elevation" => num(range::SUN_ELEVATION, &mut s.sun_elevation),
                 "sun_azimuth" => num(range::SUN_AZIMUTH, &mut s.sun_azimuth),
                 "wind" => num(range::WIND, &mut s.wind),
-                _ => {}
+                "master_volume" => num(range::VOLUME, &mut s.master_volume),
+                "sfx_volume" => num(range::VOLUME, &mut s.sfx_volume),
+                "music_volume" => num(range::VOLUME, &mut s.music_volume),
+                "ambient_volume" => num(range::VOLUME, &mut s.ambient_volume),
+                "head_bob" => flag(&mut s.head_bob),
+                "speed_fov" => flag(&mut s.speed_fov),
+                "screen_shake" => num(range::SCREEN_SHAKE, &mut s.screen_shake),
+                "difficulty" => num(range::DIFFICULTY, &mut s.difficulty),
+                "seen_intro" => flag(&mut s.seen_intro),
+                _ => {
+                    if let Some(skill) = key.strip_prefix("bind_") {
+                        s.binds.insert(skill.to_owned(), value.to_owned());
+                    }
+                }
             }
         }
         // Version 2 made the world much larger and the fog exponential, so a

@@ -242,12 +242,21 @@ struct Batch {
     /// Drawn in the main pass / into the shadow maps.
     visible: bool,
     casts_shadow: bool,
+    portal_surface: bool,
+    portal_frame: bool,
 }
 
 /// A uniform buffer with the globals layout, and its bind group.
 struct GlobalsSlot {
     buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+}
+
+struct PortalTarget {
+    _color: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    msaa_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
 }
 
 pub struct Renderer {
@@ -270,6 +279,8 @@ pub struct Renderer {
     /// Main globals (also the near shadow cascade pass), far cascade pass,
     /// sky-occlusion pass.
     globals: [GlobalsSlot; 3],
+    portal_globals: Vec<GlobalsSlot>,
+    portal_targets: Vec<PortalTarget>,
     height_map: wgpu::TextureView,
     terrain_params: [f32; 3],
     shadow_bind_group: wgpu::BindGroup,
@@ -378,6 +389,12 @@ impl Renderer {
         if let Some(format) = caps.formats.iter().copied().find(|f| f.is_srgb()) {
             config.format = format;
         }
+        // egui works in gamma space: it draws through a plain (non-sRGB)
+        // view of the same frame, or its colours come out washed out.
+        let ui_format = config.format.remove_srgb_suffix();
+        if ui_format != config.format {
+            config.view_formats = vec![ui_format];
+        }
         config.present_mode = wgpu::PresentMode::AutoVsync;
         // Allows saving screenshots (see `request_screenshot`) where supported.
         if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
@@ -485,6 +502,7 @@ impl Renderer {
             make_globals("far cascade globals"),
             make_globals("sky occlusion globals"),
         ];
+        let portal_globals: Vec<GlobalsSlot> = (0..4).map(|i| make_globals(if i == 0 { "portal view globals" } else { "portal view globals" })).collect();
 
         let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow cascades"),
@@ -741,7 +759,8 @@ impl Renderer {
         let white_texture = upload_texture(&device, &queue, &pixel([255; 4], true));
         let flat_normal_texture = upload_texture(&device, &queue, &pixel([128, 128, 255, 255], false));
         let (depth_view, msaa_view) = create_render_targets(&device, &config);
-        let ui_renderer = egui_wgpu::Renderer::new(&device, config.format, Default::default());
+        let portal_targets = (0..4).map(|i| create_portal_target(&device, config.format, i)).collect();
+        let ui_renderer = egui_wgpu::Renderer::new(&device, config.format.remove_srgb_suffix(), Default::default());
 
         Ok(Self {
             surface,
@@ -761,6 +780,8 @@ impl Renderer {
             grass: None,
             terrain: None,
             globals,
+            portal_globals,
+            portal_targets,
             height_map,
             // No terrain yet: a flat height-0 plane far bigger than any scene.
             terrain_params: [-1000.0, 100_000.0, 200_000.0],
@@ -948,16 +969,32 @@ impl Renderer {
             material: material_bind_group,
             visible: true,
             casts_shadow: true,
+            portal_surface: false,
+            portal_frame: false,
         });
         self.world_maps_dirty = true;
     }
 
     /// Sets the terrain: its mesh, the heightmap every shader can query, and
     /// the splat-mapped ground textures.
+    /// The ground changed (a crater): new vertices for the rows from
+    /// `first_row` on, and every height (for the height map the water,
+    /// grass and shadows read).
+    pub fn update_terrain(&mut self, first_row: usize, vertices: &[Vertex], heights: &[f32], res: u32) {
+        let Some(draw) = &self.terrain else { return };
+        let offset = (first_row * res as usize * std::mem::size_of::<Vertex>()) as u64;
+        self.queue.write_buffer(&draw.vertex_buffer, offset, bytemuck::cast_slice(vertices));
+        self.height_map = upload_heightmap(&self.device, &self.queue, heights, res);
+        for slot in self.globals.iter_mut().chain(self.portal_globals.iter_mut()) {
+            slot.bind_group = globals_bind_group(&self.device, &self.globals_layout, &slot.buffer, &self.height_map);
+        }
+        self.world_maps_dirty = true;
+    }
+
     pub fn set_terrain(&mut self, terrain: &TerrainData) {
         let device = &self.device;
         self.height_map = upload_heightmap(device, &self.queue, terrain.heights, terrain.res);
-        for slot in &mut self.globals {
+        for slot in self.globals.iter_mut().chain(self.portal_globals.iter_mut()) {
             slot.bind_group = globals_bind_group(device, &self.globals_layout, &slot.buffer, &self.height_map);
         }
         self.terrain_params = [terrain.water_level, terrain.half_size, terrain.cell];
@@ -1005,7 +1042,7 @@ impl Renderer {
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("terrain vertices"),
             contents: bytemuck::cast_slice(&terrain.mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("terrain indices"),
@@ -1122,6 +1159,73 @@ impl Renderer {
         index
     }
 
+    /// Adds a moving group of up to `max` copies of one mesh (a flock),
+    /// drawn in one go: returns a handle for set_instances. Starts hidden;
+    /// casts no shadows.
+    pub fn add_dynamic_group(&mut self, mesh: &MeshData, material: &MaterialData, max: usize) -> usize {
+        let hidden = Instance { transform: Mat4::from_scale(Vec3::ZERO), tint: Vec4::ONE };
+        self.add_mesh(mesh, material, &vec![hidden; max.max(1)]);
+        let index = self.batches.len() - 1;
+        let batch = &mut self.batches[index];
+        batch.casts_shadow = false;
+        batch.visible = false;
+        batch.instance_count = 0;
+        index
+    }
+
+    /// Sets where every copy in a group is this frame (extra ones beyond
+    /// its size are dropped; none hides it).
+    pub fn set_instances(&mut self, handle: usize, instances: &[Instance]) {
+        if let Some(batch) = self.batches.get_mut(handle) {
+            let capacity = (batch.instance_buffer.size() / std::mem::size_of::<InstanceRaw>() as u64) as usize;
+            let raw: Vec<InstanceRaw> = instances.iter().take(capacity).map(InstanceRaw::new).collect();
+            if !raw.is_empty() {
+                self.queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&raw));
+            }
+            batch.instance_count = raw.len() as u32;
+            batch.visible = !raw.is_empty();
+        }
+    }
+
+    /// Adds a dynamic gate frame that is omitted from linked portal views.
+    pub fn add_portal_frame(&mut self, mesh: &MeshData, material: &MaterialData) -> usize {
+        let handle = self.add_dynamic_mesh(mesh, material);
+        self.batches[handle].portal_frame = true;
+        handle
+    }
+
+    /// Adds a dynamic portal aperture surface which samples one of the live
+    /// linked-camera render targets.
+    pub fn add_portal_surface(&mut self, mesh: &MeshData, texture: usize) -> usize {
+        let handle = self.add_dynamic_mesh(mesh, &MaterialData::default());
+        if let (Some(batch), Some(target)) = (self.batches.get_mut(handle), self.portal_targets.get(texture)) {
+            let uniform = MaterialUniform {
+                base_color: [1.0; 4],
+                // Negative shininess selects the shader's unlit portal path;
+                // the captured view is already tone-mapped.
+                shading: [0.0, 0.0, -1.0, 0.0],
+                detail: [0.0; 4],
+            };
+            let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rift portal material"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            batch.material = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rift portal view"),
+                layout: &self.material_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&target.color_view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.flat_normal_texture) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            batch.portal_surface = true;
+        }
+        handle
+    }
+
     /// Replaces a dynamic object's vertices (same count as when it was added),
     /// e.g. an animated character's skinned pose.
     pub fn set_vertices(&mut self, handle: usize, vertices: &[Vertex]) {
@@ -1145,10 +1249,10 @@ impl Renderer {
         }
     }
 
-    fn draw_batches(&self, pass: &mut wgpu::RenderPass, with_materials: bool) {
+    fn draw_batches(&self, pass: &mut wgpu::RenderPass, with_materials: bool, portal_surfaces: bool) {
         for batch in &self.batches {
             // The shadow pass is the one drawn without materials.
-            if (with_materials && !batch.visible) || (!with_materials && !batch.casts_shadow) {
+            if (with_materials && (!batch.visible || (!portal_surfaces && (batch.portal_surface || batch.portal_frame)))) || (!with_materials && !batch.casts_shadow) {
                 continue;
             }
             if with_materials {
@@ -1184,7 +1288,7 @@ impl Renderer {
 
     /// `time` (seconds) animates clouds, grass and water; `ui` is drawn on
     /// top. Returns `true` when a requested screenshot was saved this frame.
-    pub fn render(&mut self, camera: &Camera, lighting: &Lighting, time: f32, mut ui: UiFrame) -> Result<bool> {
+    pub fn render(&mut self, camera: &Camera, lighting: &Lighting, time: f32, mut ui: UiFrame, gates: [Option<crate::net::GatePair>; 2]) -> Result<bool> {
         // UI textures (e.g. the font atlas) must be uploaded even when this
         // frame ends up being skipped, or they'd be lost.
         for (id, deltas) in &ui.textures_delta.set {
@@ -1192,7 +1296,7 @@ impl Renderer {
                 self.ui_renderer.update_texture(&self.device, &self.queue, *id, delta);
             }
         }
-        let result = self.render_frame(camera, lighting, time, &ui);
+        let result = self.render_frame(camera, lighting, time, &ui, gates);
         for id in &ui.textures_delta.free {
             self.ui_renderer.free_texture(id);
         }
@@ -1201,7 +1305,7 @@ impl Renderer {
         result
     }
 
-    fn render_frame(&mut self, camera: &Camera, lighting: &Lighting, time: f32, ui: &UiFrame) -> Result<bool> {
+    fn render_frame(&mut self, camera: &Camera, lighting: &Lighting, time: f32, ui: &UiFrame, gates: [Option<crate::net::GatePair>; 2]) -> Result<bool> {
         use wgpu::CurrentSurfaceTexture as Current;
         let frame = match self.surface.get_current_texture() {
             Current::Success(frame) => frame,
@@ -1219,6 +1323,10 @@ impl Renderer {
             Current::Validation => anyhow::bail!("validation error while acquiring the next frame"),
         };
         let frame_view = frame.texture.create_view(&Default::default());
+        let ui_view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.config.format.remove_srgb_suffix()),
+            ..Default::default()
+        });
 
         // --- light-space matrices -------------------------------------------
         let sun = lighting.sun_direction.normalize();
@@ -1269,6 +1377,7 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.globals[0].buffer, 0, bytemuck::bytes_of(&globals));
+        let portal_base = globals;
         globals.light_view_proj = far.to_cols_array_2d();
         self.queue
             .write_buffer(&self.globals[1].buffer, 0, bytemuck::bytes_of(&globals));
@@ -1314,6 +1423,61 @@ impl Renderer {
         self.world_maps_dirty = false;
         self.near_cascade_center = Some(near_center);
 
+        for (owner, pair) in gates.iter().enumerate().filter_map(|(i, pair)| pair.map(|pair| (i, pair))) {
+            for (end, (source, destination)) in [(pair.a, pair.b), (pair.b, pair.a)].into_iter().enumerate() {
+                let clip = camera.view_projection() * source.pos.extend(1.0);
+                if clip.w <= 0.0 || (clip.x / clip.w).abs() > 1.35 || (clip.y / clip.w).abs() > 1.35 {
+                    continue;
+                }
+                let target_index = owner * 2 + end;
+                let virtual_camera = linked_camera(camera, source, destination);
+                let view_proj = virtual_camera.view_projection();
+                let mut portal_uniform = portal_base;
+                portal_uniform.view_proj = view_proj.to_cols_array_2d();
+                portal_uniform.inv_view_proj = view_proj.inverse().to_cols_array_2d();
+                portal_uniform.camera_pos = virtual_camera.position.extend(time).to_array();
+                self.queue.write_buffer(&self.portal_globals[target_index].buffer, 0, bytemuck::bytes_of(&portal_uniform));
+                let target = &self.portal_targets[target_index];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("rift gate view"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target.msaa_view,
+                        depth_slice: None,
+                        resolve_target: Some(&target.color_view),
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &target.depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pass.set_bind_group(0, &self.portal_globals[target_index].bind_group, &[]);
+                pass.set_pipeline(&self.sky_pipeline);
+                pass.draw(0..3, 0..1);
+                if let Some(terrain) = &self.terrain {
+                    pass.set_pipeline(&self.terrain_pipeline);
+                    pass.set_bind_group(1, &terrain.bind_group, &[]);
+                    pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+                    self.draw_terrain_geometry(&mut pass);
+                }
+                pass.set_pipeline(&self.main_pipeline);
+                pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+                self.draw_batches(&mut pass, true, false);
+                if let Some(grass) = self.grass.as_ref().filter(|grass| grass.enabled) {
+                    pass.set_pipeline(&self.grass_pipeline);
+                    pass.set_bind_group(1, &grass.bind_group, &[]);
+                    pass.set_bind_group(2, &self.shadow_bind_group, &[]);
+                    pass.draw(0..7, 0..grass.instances);
+                }
+                if self.terrain.is_some() {
+                    pass.set_pipeline(&self.water_pipeline);
+                    pass.draw(0..6, 0..1);
+                }
+            }
+        }
+
         // 2. Sky, terrain, meshes, grass, water.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1352,7 +1516,7 @@ impl Renderer {
 
             pass.set_pipeline(&self.main_pipeline);
             pass.set_bind_group(2, &self.shadow_bind_group, &[]);
-            self.draw_batches(&mut pass, true);
+            self.draw_batches(&mut pass, true, true);
 
             if let Some(grass) = self.grass.as_ref().filter(|g| g.enabled) {
                 pass.set_pipeline(&self.grass_pipeline);
@@ -1381,7 +1545,7 @@ impl Renderer {
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("ui pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
+                        view: &ui_view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
@@ -1462,6 +1626,45 @@ fn create_render_targets(
             .create_view(&Default::default())
     };
     (make("depth", DEPTH_FORMAT), make("msaa color", config.format))
+}
+
+fn create_portal_target(device: &wgpu::Device, format: wgpu::TextureFormat, _index: usize) -> PortalTarget {
+    let size = wgpu::Extent3d { width: 512, height: 512, depth_or_array_layers: 1 };
+    let color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rift gate view texture"), size, mip_level_count: 1, sample_count: 1,
+        dimension: wgpu::TextureDimension::D2, format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let color_view = color.create_view(&Default::default());
+    let msaa = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rift gate multisample color"), size, mip_level_count: 1, sample_count: SAMPLE_COUNT,
+        dimension: wgpu::TextureDimension::D2, format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+    });
+    let msaa_view = msaa.create_view(&Default::default());
+    let depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rift gate depth"), size, mip_level_count: 1, sample_count: SAMPLE_COUNT,
+        dimension: wgpu::TextureDimension::D2, format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+    });
+    let depth_view = depth.create_view(&Default::default());
+    PortalTarget { _color: color, color_view, msaa_view, depth_view }
+}
+
+fn linked_camera(camera: &Camera, source: crate::net::GatePoint, destination: crate::net::GatePoint) -> Camera {
+    let yaw_delta = destination.yaw - source.yaw + std::f32::consts::PI;
+    // Gate yaw uses the camera convention (+Z as yaw increases), while a
+    // positive Y quaternion rotates +X toward -Z. Negate the portal yaw for
+    // positions so camera translation and heading use the same mapping.
+    let rotation = glam::Quat::from_rotation_y(-yaw_delta);
+    let position = destination.pos + rotation * (camera.position - source.pos);
+    // Carry both position and view orientation through the portal transform.
+    let mut virtual_camera = Camera::new(position, camera.yaw + yaw_delta, 1.0);
+    virtual_camera.pitch = camera.pitch;
+    virtual_camera.fov_y = camera.fov_y;
+    virtual_camera.near = camera.near;
+    virtual_camera
 }
 
 fn upload_heightmap(device: &wgpu::Device, queue: &wgpu::Queue, heights: &[f32], res: u32) -> wgpu::TextureView {
@@ -1598,4 +1801,16 @@ fn build_mip_chain(data: &TextureData) -> Vec<(u32, u32, Vec<u8>)> {
         levels.push((nw, nh, next));
     }
     levels
+}
+
+#[cfg(test)]
+mod shader_tests {
+    #[test]
+    fn the_shader_is_valid_wgsl() {
+        use wgpu::naga;
+        let module = naga::front::wgsl::parse_str(include_str!("shader.wgsl")).expect("parses");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .expect("validates");
+    }
 }

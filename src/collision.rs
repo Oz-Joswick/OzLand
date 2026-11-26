@@ -28,6 +28,11 @@ impl Aabb {
             && self.max.z > other.min.z
     }
 
+    /// The point of the box nearest to `p`.
+    pub fn closest_point(&self, p: Vec3) -> Vec3 {
+        p.clamp(self.min, self.max)
+    }
+
     pub fn size(&self) -> Vec3 {
         self.max - self.min
     }

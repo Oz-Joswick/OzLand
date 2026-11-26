@@ -203,6 +203,95 @@ pub struct Layout {
     pads: Vec<Pad>,
     /// Pads applied after carving the river (the bridge banks).
     bank_pads: Vec<Pad>,
+    /// The paths' graded heights (see [`Layout::height`]).
+    grade: PathGrade,
+}
+
+/// Steepest a path may climb (rise over run; 0.3 is about 17 degrees).
+const MAX_PATH_GRADE: f32 = 0.3;
+/// How far beside a path's edge the graded ground blends back into the land.
+const GRADE_BLEND: f32 = 10.0;
+
+/// Evens out a path's height profile (samples 1 m apart) until no step
+/// climbs more than `max_grade`, splitting each correction between cutting
+/// the high side and filling the low side. `fixed` samples don't move.
+fn grade_profile(heights: &mut [f32], fixed: &[bool], max_grade: f32) {
+    for _ in 0..20_000 {
+        let mut worst = 0.0f32;
+        for i in 0..heights.len().saturating_sub(1) {
+            let d = heights[i + 1] - heights[i];
+            let excess = d.abs() - max_grade;
+            if excess <= 1e-4 {
+                continue;
+            }
+            worst = worst.max(excess);
+            let s = d.signum();
+            match (fixed[i], fixed[i + 1]) {
+                (false, false) => {
+                    heights[i] += s * excess * 0.5;
+                    heights[i + 1] -= s * excess * 0.5;
+                }
+                (true, false) => heights[i + 1] -= s * excess,
+                (false, true) => heights[i] += s * excess,
+                (true, true) => {}
+            }
+        }
+        if worst <= 1e-3 {
+            break;
+        }
+    }
+}
+
+/// A 1 m grid holding, for ground near a path, the graded height of the
+/// nearest point on it, the distance to that point, and the path's half
+/// width.
+struct PathGrade {
+    origin: Vec2,
+    size: usize,
+    cells: Vec<Option<(f32, f32, f32)>>,
+}
+
+impl PathGrade {
+    fn new() -> Self {
+        let size = (2.0 * HALF).ceil() as usize + 1;
+        Self { origin: Vec2::splat(-HALF), size, cells: vec![None; size * size] }
+    }
+
+    /// Records a graded path point: nearby cells keep the nearest one.
+    fn stamp(&mut self, p: Vec2, height: f32, half_width: f32) {
+        let reach = half_width + GRADE_BLEND + 1.5;
+        let lo = ((p - Vec2::splat(reach) - self.origin).max(Vec2::ZERO)).floor();
+        let hi = ((p + Vec2::splat(reach) - self.origin).min(Vec2::splat((self.size - 1) as f32))).ceil();
+        for z in lo.y as usize..=hi.y as usize {
+            for x in lo.x as usize..=hi.x as usize {
+                let c = self.origin + Vec2::new(x as f32, z as f32);
+                let d = c.distance(p);
+                if d > reach {
+                    continue;
+                }
+                let cell = &mut self.cells[z * self.size + x];
+                if cell.is_none_or(|(_, old, _)| d < old) {
+                    *cell = Some((height, d, half_width));
+                }
+            }
+        }
+    }
+
+    /// (graded height, distance, half width) near a path, blended smoothly
+    /// between grid points.
+    fn at(&self, p: Vec2) -> Option<(f32, f32, f32)> {
+        let g = (p - self.origin).clamp(Vec2::ZERO, Vec2::splat((self.size - 1) as f32 - 1e-4));
+        let (ix, iz) = (g.x as usize, g.y as usize);
+        let f = g - Vec2::new(ix as f32, iz as f32);
+        let mut sum = (0.0, 0.0, 0.0, 0.0);
+        for (dx, dz, w) in [(0, 0, (1.0 - f.x) * (1.0 - f.y)), (1, 0, f.x * (1.0 - f.y)), (0, 1, (1.0 - f.x) * f.y), (1, 1, f.x * f.y)] {
+            let i = (iz + dz).min(self.size - 1) * self.size + (ix + dx).min(self.size - 1);
+            if let Some((h, d, hw)) = self.cells[i] {
+                sum = (sum.0 + h * w, sum.1 + d * w, sum.2 + hw * w, sum.3 + w);
+            }
+        }
+        (sum.3 > 1e-4).then(|| (sum.0 / sum.3, sum.1 / sum.3, sum.2 / sum.3))
+    }
 }
 
 impl Layout {
@@ -227,6 +316,7 @@ impl Layout {
             paving,
             pads: Vec::new(),
             bank_pads: Vec::new(),
+            grade: PathGrade::new(),
         };
         let natural = |p: Vec2| layout.natural(p);
         let pads = vec![
@@ -244,6 +334,7 @@ impl Layout {
             Pad::round(Vec2::new(BRIDGE_X, BRIDGE_ENDS.0 - 2.0), 3.5, 7.0, bank_height),
             Pad::round(Vec2::new(BRIDGE_X, BRIDGE_ENDS.1 + 2.0), 3.5, 7.0, bank_height),
         ];
+        layout.grade_paths();
         layout
     }
 
@@ -265,7 +356,8 @@ impl Layout {
         let q = p - LAKE_CENTER;
         let (s, c) = (-LAKE_ANGLE).sin_cos();
         let r = Vec2::new(q.x * c - q.y * s, q.x * s + q.y * c) / LAKE_RADII;
-        r.length() + (fbm(p * 0.025, 3, 7) - 0.5) * 0.22
+        // Broad bays and points, plus smaller coves along the way.
+        r.length() + (fbm(p * 0.025, 3, 7) - 0.5) * 0.22 + (fbm(p * 0.09, 2, 17) - 0.5) * 0.11
     }
 
     /// Rounded-square distance from the map centre (for the mountain ring).
@@ -302,12 +394,54 @@ impl Layout {
         h
     }
 
-    pub fn height(&self, p: Vec2) -> f32 {
+    /// The land before the paths are graded.
+    fn ungraded(&self, p: Vec2) -> f32 {
         let mut h = self.carved(p);
         for pad in &self.bank_pads {
             h = lerp(h, pad.height, pad.weight(p));
         }
         h
+    }
+
+    /// The final ground height: the land, with every path graded so it's
+    /// never steeper than [`MAX_PATH_GRADE`] (cut into hills, built up over
+    /// dips, blending back into the land beside it).
+    pub fn height(&self, p: Vec2) -> f32 {
+        let h = self.ungraded(p);
+        match self.grade.at(p) {
+            Some((target, distance, half_width)) => {
+                let w = 1.0 - smoothstep(half_width + 0.5, half_width + GRADE_BLEND, distance);
+                lerp(h, target, w)
+            }
+            None => h,
+        }
+    }
+
+    /// Grades the paths one after another (later paths meet earlier ones at
+    /// the height already graded there).
+    fn grade_paths(&mut self) {
+        for (points, half_width) in path_points() {
+            let line = spline(&points, 1.0);
+            let n = line.len();
+            // Start from the ground as graded so far, so where this path
+            // meets an earlier one their surfaces agree.
+            let mut heights: Vec<f32> = line.iter().map(|p| self.height(*p)).collect();
+            // Fixed: the path's ends, the flat middle of a levelled pad
+            // (village, stone circle, tower, bridge banks; their sloping
+            // edges get graded like the rest), and where it runs on a path
+            // graded before.
+            let mut fixed = vec![false; n];
+            for (i, p) in line.iter().enumerate() {
+                let on_other_path = self.grade.at(*p).is_some_and(|(_, distance, width)| distance < width + 0.5);
+                let on_pad = self.pads.iter().chain(&self.bank_pads).any(|pad| pad.weight(*p) > 0.97);
+                fixed[i] = on_other_path || on_pad || i == 0 || i + 1 == n;
+            }
+            grade_profile(&mut heights, &fixed, MAX_PATH_GRADE);
+            for (p, h) in line.iter().zip(&heights) {
+                // Never down into the water: build a causeway instead.
+                self.grade.stamp(*p, h.max(WATER + 0.3), half_width);
+            }
+        }
     }
 
     /// 0..1: how forested a spot is (before checking paths and buildings).
@@ -355,8 +489,11 @@ impl Layout {
         let path = 1.0 - smoothstep(-0.5, 0.5, self.path.at(p) + noise * 1.0);
         let litter = self.forest_density(p) * smoothstep(0.42, 0.72, fbm(p * 0.12, 3, 12)) * 0.8;
         let dirt = path.max(litter).max(garden_weight(p));
-        let rock = smoothstep(0.2, 0.34, slope + noise * 0.08).max(smoothstep(44.0, 60.0, h + noise * 8.0));
-        let sand = 1.0 - smoothstep(0.2, 1.2, h - WATER + noise * 0.6);
+        let rock = smoothstep(0.24, 0.38, slope + noise * 0.08).max(smoothstep(44.0, 60.0, h + noise * 8.0));
+        // Sand always at the waterline; further up, wide beaches in some
+        // stretches and grass down to the water in others.
+        let beach = lerp(0.35, 1.7, smoothstep(0.3, 0.7, fbm(p * 0.03, 2, 19)));
+        let sand = 1.0 - smoothstep(0.15, beach, h - WATER + noise * 0.4);
 
         // Priority: paving, then dirt, then rock, then sand.
         let a = paved;
@@ -577,6 +714,8 @@ fn undergrowth(w: &mut SceneBuilder, layout: &Layout) -> usize {
             }
             let mut placement = Placement::at(p.x, p.y).yaw(hash2(gx, gz, 705) * 360.0);
             placement = if file == LOG { placement.scale(size) } else { placement.height(size) };
+            // Lie along the slope: fully for logs and stumps, partly for plants.
+            placement = placement.tilt(if solid { 1.0 } else { 0.6 });
             if !solid {
                 placement = placement.collider(Collider::None);
             }
@@ -605,12 +744,11 @@ fn lantern_facing(w: &mut SceneBuilder, x: f32, z: f32, target: Vec2) {
 }
 
 fn rock(w: &mut SceneBuilder, x: f32, z: f32, height: f32, yaw: f32, tint: Vec4) {
-    let mut p = Placement::at(x, z).height(height).yaw(yaw).tint(tint);
+    // Leaning with the slope; the placer settles it so no edge floats.
+    let mut p = Placement::at(x, z).height(height).yaw(yaw).tint(tint).tilt(0.8).collider(Collider::Shape);
     if height < 0.35 {
         p = p.collider(Collider::None);
     }
-    // Sink rocks a little so they look bedded in.
-    p = p.at_height(w.ground(x, z) - height * 0.15);
     w.place(ROCK, p);
 }
 
@@ -980,10 +1118,7 @@ fn rocks(w: &mut SceneBuilder, layout: &Layout) {
             } else {
                 None
             };
-            let placed = scanned.and_then(|file| {
-                let g = w.ground(p.x, p.y) - size * 0.12;
-                w.place(file, Placement::at(p.x, p.y).height(size).yaw(yaw).at_height(g))
-            });
+            let placed = scanned.and_then(|file| w.place(file, Placement::at(p.x, p.y).height(size).yaw(yaw).tilt(0.8).collider(Collider::Shape)));
             if placed.is_none() {
                 rock(w, p.x, p.y, size, yaw, Vec4::new(warm, 1.0, 2.0 - warm, 1.0));
             }
@@ -994,6 +1129,50 @@ fn rocks(w: &mut SceneBuilder, layout: &Layout) {
             }
         }
     }
+}
+
+/// Big boulders set into steep slopes (bluffs, hillsides, the river
+/// banks), so they read as rocky ground rather than smooth mounds of
+/// earth. Placed half-buried on the uphill side. Returns how many.
+fn outcrops(w: &mut SceneBuilder, layout: &Layout) -> usize {
+    // A coarse pass over all slopes, then a fine one that only takes the
+    // steepest ground, so narrow cliff bands get their rocks too.
+    let mut placed = 0;
+    for (spacing, min_slope, chance, salt) in [(6.0, 0.26, 0.55, 0), (3.0, 0.4, 0.3, 50)] {
+    let n = (2.0 * HALF / spacing) as i32;
+    for gz in 0..n {
+        for gx in 0..n {
+            let (gx, gz) = (gx + salt * 1000, gz);
+            let jitter = Vec2::new(hash2(gx, gz, 601), hash2(gx, gz, 602));
+            let p = Vec2::new(-HALF, -HALF) + (Vec2::new((gx - salt * 1000) as f32, gz as f32) + jitter) * spacing;
+            if Layout::edge_distance(p) > 165.0 {
+                continue;
+            }
+            let slope = 1.0 - w.terrain.normal_at(p.x, p.y).y;
+            if !(min_slope..1.01).contains(&slope) || hash2(gx, gz, 603) > chance {
+                continue;
+            }
+            if !layout.open_ground(p, 3.0) || layout.lake_distance(p) < 1.05 || !clear_of_colliders(&w.colliders, p, 3.0) {
+                continue;
+            }
+            // Steeper ground, bigger stone.
+            let size = lerp(2.2, 5.5, smoothstep(0.26, 0.7, slope) * 0.6 + hash2(gx, gz, 604) * 0.4);
+            let yaw = hash2(gx, gz, 605) * 360.0;
+            let shade = lerp(0.85, 1.05, hash2(gx, gz, 606));
+            // A touch cooler than the scans, to sit with the grey cliffs.
+            let tint = Vec4::new(shade * 0.86, shade * 0.88, shade * 0.92, 1.0);
+            let file = if hash2(gx, gz, 607) < 0.5 { BOULDER } else { MOSS_ROCKS };
+            // Settled so no edge hangs in the air: on a steep slope it beds
+            // deep into the uphill side.
+            let p3 = Placement::at(p.x, p.y).height(size).yaw(yaw).tint(tint).tilt(0.6).collider(Collider::Shape);
+            if w.place(file, p3).is_none() {
+                rock(w, p.x, p.y, size, yaw, tint);
+            }
+            placed += 1;
+        }
+    }
+    }
+    placed
 }
 
 fn trees(w: &mut SceneBuilder, layout: &Layout) -> usize {
@@ -1105,8 +1284,10 @@ pub fn build() -> Scene {    let started = Instant::now();
     stone_circle(&mut w);
     fishers_rest(&mut w);
     viewpoint(&mut w);
+    let outcrop_count = outcrops(&mut w, &layout);
     rocks(&mut w, &layout);
     let tree_count = trees(&mut w, &layout);
+    log::info!("set {outcrop_count} rock outcrops into the slopes");
     let plants = undergrowth(&mut w, &layout);
     log::info!("placed {tree_count} trees, {plants} plants/logs, {} colliders", w.colliders.len());
 
@@ -1203,6 +1384,42 @@ mod tests {
         assert!(l.height(Vec2::new(0.0, 195.0)) > 40.0, "mountains at the edge");
         // The pier reaches deep enough water.
         assert!(l.height(Vec2::new(-36.0, PIER_Z)) < WATER - 0.8);
+    }
+
+    /// Steepest climb along each path (over 1 m), for `height`, with where.
+    fn path_slopes(height: impl Fn(Vec2) -> f32) -> Vec<(f32, Vec2)> {
+        path_points()
+            .iter()
+            .map(|(points, _)| {
+                let line = spline(points, 0.5);
+                line.windows(3)
+                    .map(|w| ((height(w[2]) - height(w[0])).abs() / w[0].distance(w[2]).max(0.01), w[1]))
+                    .fold((0.0f32, Vec2::ZERO), |a, b| if b.0 > a.0 { b } else { a })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paths_are_comfortable_to_walk() {
+        let l = Layout::new();
+        let before = path_slopes(|p| l.ungraded(p));
+        let after = path_slopes(|p| l.height(p));
+        for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+            eprintln!("path {i}: steepest {:.2} at ({:.0}, {:.0}) before grading, {:.2} after", b.0, b.1.x, b.1.y, a.0);
+        }
+        for (i, (slope, at)) in after.iter().enumerate() {
+            // The player climbs up to 1.2; paths stay far gentler.
+            assert!(*slope < 0.5, "path {i} is too steep ({slope:.2}) near {at:?}");
+        }
+    }
+
+    #[test]
+    fn grading_keeps_steps_within_the_limit_and_pinned_points_still() {
+        let mut h = vec![0.0, 0.0, 5.0, 5.0, 0.0, 0.0];
+        let fixed = [true, false, false, false, false, true];
+        grade_profile(&mut h, &fixed, 0.35);
+        assert!(h.windows(2).all(|w| (w[1] - w[0]).abs() <= 0.35 + 2e-3), "{h:?}");
+        assert_eq!((h[0], h[5]), (0.0, 0.0));
     }
 
     #[test]

@@ -1,6 +1,6 @@
-git [package]
+[package]
 name = "OzLand"
-version = "0.1.1"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,7 @@ egui-wgpu = "0.37"
 egui-winit = "0.37"
 env_logger = "0.11.12"
 glam = { version = "0.34.3", features = ["bytemuck"] }
+igd-next = "0.18.0"
 gltf = "1.4.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 log = "0.4.35"
@@ -20,6 +21,8 @@ ureq = "3.5.2"
 wgpu = "30.0.2"
 winit = "0.30.13"
 zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+cpal = "0.18.2"
+steamworks = "0.13.1"
 
 # Debug builds: optimize dependencies (image decoding, glTF parsing, wgpu) so
 # loading textured models takes a moment instead of many seconds. They are

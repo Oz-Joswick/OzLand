@@ -432,6 +432,11 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> @locatio
     }
 
     let texel = textureSampleGrad(base_texture, material_sampler, uv, uv_dx, uv_dy);
+    // Portal captures are already lit and tone-mapped in their virtual view.
+    // Display them directly instead of applying the surface lighting twice.
+    if material.shading.z < 0.0 {
+        return texel * material.base_color * in.color;
+    }
     let mapped = textureSampleGrad(normal_texture, material_sampler, uv, uv_dx, uv_dy).xyz * 2.0 - 1.0;
 
     var albedo = material.base_color * in.color * texel;
@@ -525,6 +530,10 @@ fn fs_terrain(in: VertexOut) -> @location(0) vec4<f32> {
     let rock_x = textureSample(terrain_albedo, terrain_sampler, in.world_position.zy * inv_tile[2], 2).rgb;
     let rock_z = textureSample(terrain_albedo, terrain_sampler, in.world_position.xy * inv_tile[2], 2).rgb;
     albedos[2] = albedos[2] * (1.0 - side_w.x - side_w.y) + rock_x * side_w.x + rock_z * side_w.y;
+    // Weathered grey stone, keeping only a little of the texture's warmth,
+    // so cliffs read as rock and not as bare orange clay.
+    let rock_grey = dot(albedos[2], vec3<f32>(0.3, 0.55, 0.15));
+    albedos[2] = mix(vec3<f32>(rock_grey), albedos[2], 0.45) * vec3<f32>(0.96, 0.98, 1.02);
 
     // Height-based blending: the highest layer (weight + height) wins, with
     // a soft band below it.
@@ -546,6 +555,11 @@ fn fs_terrain(in: VertexOut) -> @location(0) vec4<f32> {
     }
     albedo /= total;
     specular /= total;
+    // Scorched ground round a crater (vertex alpha: 1 = untouched): burnt,
+    // darkened earth.
+    let scorch = clamp(1.0 - in.color.a, 0.0, 1.0);
+    albedo = mix(albedo, albedos[1] * vec3<f32>(0.3, 0.26, 0.23), scorch * 0.85);
+    specular *= 1.0 - scorch * 0.6;
 
     // Large-scale color variation so the land doesn't look tiled.
     let broad = fbm(vec3<f32>(p.x, 0.0, p.y) * 0.045 + vec3<f32>(5.0, 0.0, 5.0));

@@ -32,7 +32,11 @@ param(
     [string]$Repo,
     # Where the files will be downloadable from (default for GitHub:
     # https://github.com/<Repo>/releases/latest/download/).
-    [string]$Url
+    [string]$Url,
+    # Also put the ready-to-share folder and zip in your Downloads folder.
+    [switch]$Share,
+    # Build only: don't upload, even if the GitHub CLI is installed.
+    [switch]$NoPublish
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
@@ -72,7 +76,20 @@ if ($LASTEXITCODE -ne 0) { throw "The build failed." }
 $out = "release"
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }
 New-Item -ItemType Directory $out | Out-Null
-Copy-Item target\release\untitled.exe "$out\walkabout.exe"
+$packageName = [regex]::Match($toml, '(?m)^name = "([^"]+)"').Groups[1].Value
+if (-not $packageName) { throw "Could not read the Cargo package name." }
+Copy-Item "target\release\$packageName.exe" "$out\walkabout.exe"
+
+# Steam's library (multiplayer through Steam, see src/steam.rs). The build
+# puts it beside the executable; it travels with the assets, which unpack
+# next to the game.
+$steamDll = "target\release\steam_api64.dll"
+if (-not (Test-Path $steamDll)) {
+    $found = Get-ChildItem target\release\build -Recurse -Filter steam_api64.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) { throw "steam_api64.dll wasn't found: run 'cargo build --release' once more." }
+    $steamDll = $found.FullName
+}
+$steamDll = (Resolve-Path $steamDll).Path
 
 # --- Assets hash (contents, not dates: unchanged assets aren't re-downloaded) --
 $root = (Resolve-Path assets).Path
@@ -81,6 +98,7 @@ $lines = foreach ($f in $files) {
     $rel = $f.FullName.Substring($root.Length + 1).Replace('\', '/')
     "${rel}:$((Get-FileHash $f.FullName -Algorithm SHA256).Hash)"
 }
+$lines += "steam_api64.dll:$((Get-FileHash $steamDll -Algorithm SHA256).Hash)"
 $sha = [Security.Cryptography.SHA256]::Create()
 $digest = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($lines -join "`n")))
 $hash = ([BitConverter]::ToString($digest)).Replace("-", "").Substring(0, 16).ToLower()
@@ -101,30 +119,46 @@ $assetEntries = New-Object System.Collections.ArrayList
 foreach ($f in Get-ChildItem assets -Recurse -File) {
     [void]$assetEntries.Add(@($f.FullName, ("assets/" + $f.FullName.Substring($root.Length + 1).Replace('\', '/'))))
 }
+[void]$assetEntries.Add(@($steamDll, "steam_api64.dll"))
 New-Zip "$out\assets.zip" $assetEntries
 
 Set-Content "$out\update.cfg" "# Where this copy of the game checks for updates.`r`nurl = $Url" -Encoding ascii
 Set-Content "$out\manifest.txt" "version = $Version`r`nassets = $hash" -Encoding ascii
 
+# The full download for new players: a folder named after the game with
+# the game, its assets, the update address and how to play.
+$fullName = "$packageName.zip"
 $full = New-Object System.Collections.ArrayList
-[void]$full.Add(@((Resolve-Path "$out\walkabout.exe").Path, "walkabout/walkabout.exe"))
-[void]$full.Add(@((Resolve-Path "$out\update.cfg").Path, "walkabout/update.cfg"))
-foreach ($e in $assetEntries) { [void]$full.Add(@($e[0], ("walkabout/" + $e[1]))) }
-New-Zip "$out\walkabout-full.zip" $full
+[void]$full.Add(@((Resolve-Path "$out\walkabout.exe").Path, "$packageName/$packageName.exe"))
+[void]$full.Add(@((Resolve-Path "$out\update.cfg").Path, "$packageName/update.cfg"))
+[void]$full.Add(@((Resolve-Path "tools\how-to-play.txt").Path, "$packageName/How to play.txt"))
+foreach ($e in $assetEntries) { [void]$full.Add(@($e[0], ("$packageName/" + $e[1]))) }
+New-Zip "$out\$fullName" $full
 Remove-Item "$out\update.cfg"
 
-$uploads = @("$out\manifest.txt", "$out\walkabout.exe", "$out\assets.zip", "$out\walkabout-full.zip")
+$uploads = @("$out\manifest.txt", "$out\walkabout.exe", "$out\assets.zip", "$out\$fullName")
+
+# --- Share: the folder and zip in Downloads -------------------------------------
+if ($Share) {
+    $downloads = Join-Path $env:USERPROFILE "Downloads"
+    $zipTarget = Join-Path $downloads $fullName
+    $folderTarget = Join-Path $downloads $packageName
+    Copy-Item "$out\$fullName" $zipTarget -Force
+    if (Test-Path $folderTarget) { Remove-Item -Recurse -Force $folderTarget }
+    [IO.Compression.ZipFile]::ExtractToDirectory($zipTarget, $downloads)
+    Write-Host "Shareable copy: $folderTarget and $zipTarget"
+}
 
 # --- Publish ---------------------------------------------------------------
 $gh = Get-Command gh -ErrorAction SilentlyContinue
-if ($gh -and $Repo) {
+if ($gh -and $Repo -and -not $NoPublish) {
     $ErrorActionPreference = "Continue"
-    & $gh.Source release create "v$Version" @uploads --repo $Repo --title "3D Walkabout $Version" --notes "Version $Version. Existing copies update themselves on their next start."
+    & $gh.Source release create "v$Version" @uploads --repo $Repo --title "$packageName $Version" --notes "Version $Version. Existing copies update themselves on their next start."
     $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0) { throw "Uploading the release failed (is gh logged in? run: gh auth login)." }
     Write-Host ""
     Write-Host "Published version $Version. Friends' games update on their next start."
-    Write-Host "New players: download walkabout-full.zip from https://github.com/$Repo/releases/latest"
+    Write-Host "New players: download $fullName from https://github.com/$Repo/releases/latest"
 } else {
     Write-Host ""
     Write-Host "Built version $Version in .\release. Upload these four files so they're downloadable at:"
