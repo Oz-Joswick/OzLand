@@ -1,0 +1,43 @@
+name: Publish game release
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - assets/**
+      - tools/release.ps1
+      - .github/workflows/publish-release.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $toml = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($toml, '(?m)^version = "([^"]+)"').Groups[1].Value
+          if (-not $version) { throw "Could not read the Cargo package version." }
+
+          gh release view "v$version" --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release v$version already exists; nothing to publish."
+            exit 0
+          }
+
+          .\tools\release.ps1 -Version $version -Repo $env:GITHUB_REPOSITORY
