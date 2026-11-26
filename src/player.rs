@@ -650,7 +650,10 @@ impl Player {
         // Walking direction, flattened onto the ground plane.
         let forward = Vec3::new(yaw.cos(), 0.0, yaw.sin());
         let right = Vec3::new(-forward.z, 0.0, forward.x);
-        let wish = (forward * controls.forward + right * controls.right).normalize_or_zero();
+        // Full input walks at full speed; smaller input (casting, blocking,
+        // being chilled) walks slower. Clamped, not normalized, so a
+        // diagonal isn't faster but a scaled-down input stays slow.
+        let wish = (forward * controls.forward + right * controls.right).clamp_length_max(1.0);
         let swimming = terrain.height_at(self.pos.x, self.pos.z) < terrain.water_level - MAX_WADE_DEPTH
             && self.pos.y < terrain.water_level + 0.8;
 
@@ -912,7 +915,7 @@ impl Player {
         let right = Vec3::new(-yaw.sin(), 0.0, yaw.cos());
         let boost = 1.0;
         self.ground_velocity *= (-2.5 * dt).exp();
-        let v = (look * controls.forward + right * controls.right).normalize_or_zero() * FLY_SPEED * moves.fly_speed * boost;
+        let v = (look * controls.forward + right * controls.right).clamp_length_max(1.0) * FLY_SPEED * moves.fly_speed * boost;
         self.vel_y = v.y;
         let blocked = self.travel(v * dt, colliders, terrain, 0.0);
         self.ground_velocity = Vec3::new(v.x, 0.0, v.z) * (Vec3::ONE - blocked);

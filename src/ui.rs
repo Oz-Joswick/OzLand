@@ -26,6 +26,8 @@ const UNLOCKED: Color32 = Color32::from_rgb(140, 225, 150);
 const WARM: Color32 = Color32::from_rgb(255, 180, 90);
 /// Capstones (the fifth, strongest level of each tree).
 const GOLD: Color32 = Color32::from_rgb(255, 205, 90);
+/// Spell pink (the cast bar and sigil).
+const MAGIC: Color32 = Color32::from_rgb(255, 120, 215);
 const PANEL: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 150);
 
 /// What an ability tile shows.
@@ -38,6 +40,9 @@ pub enum SlotState {
     Active(f32),
     /// Nothing to do right now (e.g. no clone to swap with).
     Unavailable,
+    /// A spell planted and waiting: press its key to cast it. Its boost
+    /// (overcharge, fading) and fuse left (1 .. 0).
+    Primed { boost: f32, fuse: f32 },
 }
 
 /// One tile on the ability hotbar.
@@ -1669,7 +1674,7 @@ fn draw_hud(ctx: &egui::Context, settings: &Settings, progress: &Progress, hud: 
         let pos = screen.left_top() + vec2(14.0, 38.0);
         shadow_text(&painter, pos, Align2::LEFT_TOP, "Waiting for the other player...", FontId::proportional(13.0), WARM);
     }
-    let top = draw_hotbar(&painter, screen, &hud.slots);
+    let top = draw_hotbar(&painter, screen, &hud.slots, fx.time);
     let top = draw_weapons(&painter, screen, &hud.weapons, top);
     if let Some(v) = &hud.vitals {
         draw_vitals(&painter, screen, v, fx.time, top);
@@ -2012,7 +2017,7 @@ const GAP: f32 = 6.0;
 
 /// Bottom centre: one tile per ability you can trigger. Returns the top
 /// of the bar (for stacking the weapon bar above it).
-fn draw_hotbar(painter: &egui::Painter, screen: Rect, slots: &[Slot]) -> f32 {
+fn draw_hotbar(painter: &egui::Painter, screen: Rect, slots: &[Slot], time: f32) -> f32 {
     let bottom = screen.bottom() - 14.0;
     if slots.is_empty() {
         return bottom;
@@ -2022,20 +2027,46 @@ fn draw_hotbar(painter: &egui::Painter, screen: Rect, slots: &[Slot]) -> f32 {
     let y = bottom - TILE;
     for slot in slots {
         let rect = Rect::from_min_size(Pos2::new(x, y), vec2(TILE, TILE));
-        draw_tile(painter, rect, slot);
+        draw_tile(painter, rect, slot, time);
         x += TILE + GAP;
     }
     y
 }
 
-fn draw_tile(painter: &egui::Painter, rect: Rect, slot: &Slot) {
+fn draw_tile(painter: &egui::Painter, rect: Rect, slot: &Slot, time: f32) {
     painter.rect_filled(rect, 8.0, PANEL);
     let (border, text) = match slot.state {
         SlotState::Ready => (Stroke::new(1.0, Color32::from_white_alpha(70)), Color32::WHITE),
         SlotState::Active(_) => (Stroke::new(2.5, ACCENT), ACCENT),
         SlotState::Cooldown(_) => (Stroke::new(1.0, Color32::from_white_alpha(30)), Color32::from_gray(160)),
         SlotState::Unavailable => (Stroke::new(1.0, Color32::from_white_alpha(20)), Color32::from_gray(110)),
+        SlotState::Primed { boost, .. } => {
+            let color = if boost > 1.05 { GOLD } else { MAGIC };
+            (Stroke::new(2.5, color.gamma_multiply(0.6 + 0.4 * (time * 5.0).sin().abs())), Color32::WHITE)
+        }
     };
+    // Planted and waiting: a glow, a small turning sigil, what it'll go off
+    // at (its overcharge fading) and its fuse burning down.
+    if let SlotState::Primed { boost, fuse } = slot.state {
+        let color = if boost > 1.05 { GOLD } else { MAGIC };
+        let pulse = 0.5 + 0.5 * (time * 5.0).sin().abs();
+        painter.rect_filled(rect, 8.0, color.gamma_multiply(0.12 + 0.1 * pulse));
+        painter.rect_stroke(rect.expand(2.0 + 2.0 * pulse), 10.0, Stroke::new(1.5, color.gamma_multiply(0.35 * pulse)), StrokeKind::Outside);
+        let centre = rect.center() + vec2(0.0, -4.0);
+        painter.circle_stroke(centre, 10.0, Stroke::new(1.2, color.gamma_multiply(0.8)));
+        for i in 0..8 {
+            let a = time * 0.8 + i as f32 * std::f32::consts::TAU / 8.0;
+            painter.circle_filled(centre + vec2(a.cos(), a.sin()) * 10.0, 1.5, color);
+        }
+        let c = 4.0;
+        painter.line_segment([centre + vec2(-c, c), centre + vec2(c, -c)], Stroke::new(1.6, color));
+        painter.line_segment([centre + vec2(-c, -c), centre + vec2(c, c)], Stroke::new(1.2, color.gamma_multiply(0.8)));
+        let label = if boost > 1.05 { format!("{:.0}%", boost * 100.0) } else { "CAST".to_owned() };
+        painter.text(rect.right_top() + vec2(-6.0, 6.0), Align2::RIGHT_TOP, label, FontId::proportional(10.5), color);
+        let urgent = fuse < 0.15 && (time * 10.0).sin() > 0.0;
+        let bar = Rect::from_min_size(rect.left_bottom() + vec2(4.0, -6.0), vec2((rect.width() - 8.0) * fuse.clamp(0.0, 1.0), 3.0));
+        painter.rect_filled(bar, 1.5, if urgent { WARM } else { color });
+    }
     // Cooldown: a dark shutter that lowers as it recharges.
     if let SlotState::Cooldown(left) = slot.state {
         let h = rect.height() * left.clamp(0.0, 1.0);

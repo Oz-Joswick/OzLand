@@ -104,13 +104,6 @@ fn centred(spell: abilities::Skill) -> bool {
     matches!(element(spell), Element::Life) || spell == abilities::Skill::FrostNova
 }
 
-/// Spells arcane clones cast too, from where they stand: the ones that
-/// strike something.
-fn clone_copies(spell: abilities::Skill) -> bool {
-    use abilities::Skill::*;
-    matches!(spell, Meteor | ChainLightning | Blizzard | Fireball | ArcaneMissiles | ArcaneLance | FrostNova)
-}
-
 /// Spells whose shots fly from the circle towards the target.
 fn shot_spell(spell: abilities::Skill) -> bool {
     use abilities::Skill::*;
@@ -123,6 +116,8 @@ struct Rune {
     boost: f32,
     at: SpellPlace,
     fuse: f32,
+    /// An arcane clone's copy of your rune.
+    clone: bool,
 }
 
 /// What a spell is made of, for reactions between runes.
@@ -224,8 +219,9 @@ mod rune_tests {
     }
 }
 
-/// Walking speed while casting (a crawl), and with Unshakable Will.
-const CAST_WALK: f32 = 0.25;
+/// Walking speed while casting (barely moving: you're rooted to your
+/// circle), and with Unshakable Will.
+const CAST_WALK: f32 = 0.04;
 const CAST_WALK_STEADY: f32 = 0.6;
 
 /// Whirlwind reaches only what's right beside you.
@@ -1246,6 +1242,9 @@ impl Game {
             if have && self.progress.equipped(skill) {
                 let state = match self.casting {
                     Some((s, t, total)) if s == skill => SlotState::Active((1.0 - t / total).max(0.0)),
+                    _ if let Some(r) = self.runes.iter().find(|r| r.spell == skill) => {
+                        SlotState::Primed { boost: r.boost, fuse: (r.fuse / RUNE_LIFE).clamp(0.0, 1.0) }
+                    }
                     _ if skill == Skill::ChronoEcho && self.echo_charges > 0 => SlotState::Active(self.echo_left / ECHO_WINDOW),
                     _ if skill == Skill::Haste && self.haste_left > 0.0 => SlotState::Active(self.haste_left / haste_time(moves)),
                     _ if self.buff_left[skill.index()] > 0.0 => SlotState::Active(self.buff_left[skill.index()] / buff_time(skill, moves)),
@@ -2115,7 +2114,22 @@ impl Game {
     fn set_rune(&mut self, spell: abilities::Skill, boost: f32, origin: glam::Vec3) {
         let at = self.spell_aim(spell, origin);
         self.runes.retain(|r| r.spell != spell);
-        self.runes.push(Rune { spell, boost, at, fuse: RUNE_LIFE });
+        self.runes.push(Rune { spell, boost, at, fuse: RUNE_LIFE, clone: false });
+        // Your arcane clones cast it with you: each plants its own rune
+        // where it stands, aimed at the same thing.
+        for pos in self.clones.arcane() {
+            let mut copy = self.spell_aim(spell, pos);
+            if !centred(spell) {
+                copy.target = at.target;
+                copy.dir = (at.target - (pos + glam::Vec3::Y * 1.3)).normalize_or(at.dir);
+            }
+            self.runes.push(Rune { spell, boost, at: copy, fuse: RUNE_LIFE, clone: true });
+            self.weapons.add_flash(pos + glam::Vec3::Y * 0.5, 0.8 + boost * 0.4);
+        }
+        // Planting a spell is one of the arcane clones' five actions.
+        if self.clones.spend_action(&mut self.renderer) > 0 {
+            self.notify("Your arcane clones faded after their five spells (their runes stay).");
+        }
         self.cooldowns[spell.index()] = skill_cooldown(spell);
         self.weapons.add_flash(origin + glam::Vec3::Y * 0.5, 1.0 + boost * 0.5);
         self.audio.play_at(audio::Sfx::Marker, origin);
@@ -2124,55 +2138,39 @@ impl Game {
         self.notify(format!("{} ready{charge}: press {key} to cast it", spell.name()));
     }
 
-    /// A rune set off by its own key: it goes off, your arcane clones cast
-    /// it too (from where they stand, at the same target), and it counts
-    /// as an ability for Chrono Echo and your clone's actions.
-    fn release_rune(&mut self, rune: Rune) {
-        let spell = rune.spell;
-        let (at, boost) = (rune.at, rune.boost);
-        self.detonate(vec![rune]);
-        // Only spells that strike from where they're cast are worth a
-        // copy: a clone's Ward, Haste or Rejuvenate would just buff or
-        // heal you again.
-        let copies = if clone_copies(spell) { self.clones.arcane() } else { Vec::new() };
-        for pos in copies {
-            self.weapons.add_flash(pos + glam::Vec3::Y * 1.4, 1.0);
-            let mut copy = self.spell_aim(spell, pos);
-            if !centred(spell) {
-                copy.target = at.target;
-                copy.dir = (at.target - (pos + glam::Vec3::Y * 1.3)).normalize_or(at.dir);
-            }
-            let cooldown = self.cooldowns[spell.index()];
-            self.spell_at = Some(copy);
-            self.spell_from = Some(pos);
-            self.spell_boost = boost;
-            self.cast_spell(spell);
-            self.cooldowns[spell.index()] = cooldown;
-        }
-        self.spell_at = None;
-        self.spell_from = None;
-        self.spell_boost = 1.0;
+    /// A spell's key pressed while it's planted: your rune and your arcane
+    /// clones' copies of it all go off, and it counts for Chrono Echo.
+    fn release_rune(&mut self, spell: abilities::Skill) {
+        let (go, keep): (Vec<Rune>, Vec<Rune>) = std::mem::take(&mut self.runes).into_iter().partition(|r| r.spell == spell);
+        self.runes = keep;
+        self.detonate(go);
         arm_echo(&mut self.echo_charges, &mut self.echo_repeat, spell, glam::Vec3::ZERO);
-        if self.clones.spend_action(&mut self.renderer) > 0 {
-            self.notify("Your clone faded after its five actions.");
-        }
     }
 
-    /// Runes going off together. Each is stronger for every other one in
-    /// the group (resonance), and different elements close together react.
+    /// Runes going off together. Each is stronger for every other one of
+    /// yours in the group (resonance: clones' copies don't add to it), and
+    /// different elements close together react.
     fn detonate(&mut self, runes: Vec<Rune>) {
-        let resonance = 1.0 + RESONANCE * (runes.len() as f32 - 1.0);
+        let own = runes.iter().filter(|r| !r.clone).count();
+        let resonance = 1.0 + RESONANCE * (own.max(1) as f32 - 1.0);
         for r in &runes {
             let cooldown = self.cooldowns[r.spell.index()];
             self.spell_boost = r.boost * resonance;
             self.spell_at = Some(r.at);
+            // A clone's copy goes off from the clone (it isn't one of your
+            // spells, and doesn't buff or heal you again).
+            self.spell_from = r.clone.then_some(r.at.origin);
+            if r.clone {
+                self.weapons.add_flash(r.at.origin + glam::Vec3::Y * 1.4, 1.0);
+            }
             self.cast_spell(r.spell);
             self.cooldowns[r.spell.index()] = cooldown;
         }
         self.spell_boost = 1.0;
         self.spell_at = None;
-        if runes.len() > 1 {
-            self.announce("RESONANCE", format!("{} runes at once: each {:.0}% stronger", runes.len(), (resonance - 1.0) * 100.0), ui::BANNER_BLUE, audio::Sfx::Unlock);
+        self.spell_from = None;
+        if own > 1 {
+            self.announce("RESONANCE", format!("{own} runes at once: each {:.0}% stronger", (resonance - 1.0) * 100.0), ui::BANNER_BLUE, audio::Sfx::Unlock);
         }
         let power = resonance * runes.iter().map(|r| r.boost).fold(1.0, f32::max);
         // React with each other, and with runes set off a moment ago (with
@@ -2264,7 +2262,7 @@ impl Game {
                     self.weapons.add_flash(pos + glam::Vec3::Y, 1.4);
                 }
                 self.audio.play(audio::Sfx::Clone);
-                self.notify(format!("Arcane clones ready: they mirror your next {} attacks and spells.", clones::CLONE_ACTIONS));
+                self.notify(format!("Arcane clones ready: they plant a copy of each of your next {} spells.", clones::CLONE_ACTIONS));
             }
             Skill::Meteor => {
                 let Some(target) = self.spell_target() else {
@@ -2323,6 +2321,11 @@ impl Game {
                     }
                 }
                 self.audio.play_at(audio::Sfx::Freeze, target);
+            }
+            // A clone's copy of a spell that buffs you: just its glow.
+            Skill::ArcaneWard | Skill::Haste if self.spell_from.is_some() => {
+                let from = self.spell_from.unwrap_or(self.player.pos);
+                self.weapons.add_flash(from + glam::Vec3::Y, 1.2);
             }
             Skill::ArcaneWard => {
                 self.vitals.ward = moves.ward * power;
@@ -2391,8 +2394,13 @@ impl Game {
             Skill::FrostNova => self.frost_nova(&moves, power),
             Skill::Rejuvenate => {
                 let renewal = moves.rejuvenate >= 2;
-                self.heal(if renewal { 50.0 } else { 30.0 }, false);
-                if renewal {
+                // A clone's copy lays its own healing circle but doesn't
+                // heal you outright again.
+                let own = self.spell_from.is_none();
+                if own {
+                    self.heal(if renewal { 50.0 } else { 30.0 }, false);
+                }
+                if renewal && own {
                     self.vitals.ward = self.vitals.ward.max(60.0 * moves.spell_power);
                     self.vitals.ward_time = 8.0;
                 }
@@ -2459,8 +2467,10 @@ impl Game {
             }
         }
         self.cooldowns[spell.index()] = skill_cooldown(spell);
-        self.audio.play(audio::Sfx::SpellRelease);
-        self.notify(format!("{}!", spell.rank_info(self.progress.rank(spell).max(1)).name));
+        if self.spell_from.is_none() {
+            self.audio.play(audio::Sfx::SpellRelease);
+            self.notify(format!("{}!", spell.rank_info(self.progress.rank(spell).max(1)).name));
+        }
     }
 
     /// Teleport through either endpoint when the player's movement crosses
@@ -2770,11 +2780,8 @@ impl Game {
                     return;
                 }
                 // Its rune is lying out there: this press casts it.
-                if self.casting.is_none()
-                    && let Some(i) = self.runes.iter().position(|r| r.spell == spell)
-                {
-                    let rune = self.runes.remove(i);
-                    self.release_rune(rune);
+                if self.casting.is_none() && self.runes.iter().any(|r| r.spell == spell) {
+                    self.release_rune(spell);
                     return;
                 }
                 // Pressing the key again while casting calls it off.
@@ -4020,16 +4027,7 @@ impl Game {
                         shooters.push((pos + glam::Vec3::Y * 1.35, dir));
                     }
                 }
-                // Arcane clones copy the attack from where they stand, at
-                // what you're aiming at.
-                for pos in self.clones.arcane() {
-                    if self.weapons.current.is_melee() {
-                        shooters.push((pos + glam::Vec3::Y * 1.3, aim));
-                    } else {
-                        let from = pos + glam::Vec3::Y * 1.35;
-                        shooters.push((from, target - from));
-                    }
-                }
+                // (Arcane clones don't fight: they only cast your spells.)
                 let authority = self.net.as_ref().is_none_or(|n| n.is_host() || !n.connected());
                 // Split Shot: every gun shot fans out into several, each weaker.
                 let mut fire_moves = moves;
@@ -4075,11 +4073,6 @@ impl Game {
                         && t.note(tutorial::Did::Swung)
                     {
                         self.audio.play(audio::Sfx::Toast);
-                    }
-                    // One action per pull of the trigger (or charged release),
-                    // however many shots a held gun fires.
-                    if (input.left_clicked() || input.left_released()) && self.clones.spend_action(&mut self.renderer) > 0 {
-                        message = Some("Your clone faded after its five actions.".into());
                     }
                     self.audio.play(weapon_sound(v.weapon));
                     let kick = match v.weapon {
@@ -4449,20 +4442,35 @@ impl Game {
             // Circles: each planted spell's (and a small one on what it's
             // aimed at), and while casting, the circle being drawn and
             // where the spell is aimed right now.
-            let mut marks: Vec<(glam::Vec3, glam::Vec4, f32, f32)> = Vec::new();
-            for r in &self.runes {
-                let (color, left) = (element(r.spell).color(), (r.fuse / 8.0).min(1.0));
-                marks.push((r.at.origin, color, left, 2.4));
-                if !centred(r.spell) {
-                    marks.push((r.at.target, color * 0.6, left, 1.2));
+            let mut marks: Vec<placement::RuneMark> = Vec::new();
+            let mut mark = |spell: abilities::Skill, at: SpellPlace, color: glam::Vec4, left: f32, grow: f32| {
+                if centred(spell) {
+                    // Goes off round itself: a circle on the ground.
+                    marks.push(placement::RuneMark { at: at.origin + glam::Vec3::Y * 0.12, facing: glam::Vec3::Y, color, left, size: 2.4 * grow });
+                } else {
+                    // Aimed: the circle stands where its shots leave from,
+                    // facing what it's aimed at, and a small one marks that.
+                    let hand = at.origin + glam::Vec3::Y * 1.3;
+                    marks.push(placement::RuneMark { at: hand, facing: at.dir, color, left, size: 1.15 * grow });
+                    marks.push(placement::RuneMark { at: at.target + glam::Vec3::Y * 0.12, facing: glam::Vec3::Y, color: color * 0.6, left, size: 1.2 });
                 }
+            };
+            for r in &self.runes {
+                mark(r.spell, r.at, element(r.spell).color(), (r.fuse / 8.0).min(1.0), 1.0);
             }
             if let Some((spell, t, total)) = self.casting.filter(|(s, _, _)| rune_able(*s)) {
-                let color = element(spell).color() * (0.4 + 0.6 * (t / total).min(1.0));
-                marks.push((self.cast_origin, color, 1.0, 2.4 * (0.4 + 0.6 * (t / total).min(1.0))));
-                if !centred(spell) {
-                    let aim = self.spell_aim(spell, self.cast_origin);
-                    marks.push((aim.target, color * 0.6, 1.0, 1.2));
+                // The circle being drawn grows and brightens as the bar fills.
+                let grow = 0.4 + 0.6 * (t / total).min(1.0);
+                let aim = self.spell_aim(spell, self.cast_origin);
+                mark(spell, aim, element(spell).color() * grow, 1.0, grow);
+                // Your arcane clones draw theirs alongside, at the same aim.
+                for pos in self.clones.arcane() {
+                    let mut copy = self.spell_aim(spell, pos);
+                    if !centred(spell) {
+                        copy.target = aim.target;
+                        copy.dir = (aim.target - (pos + glam::Vec3::Y * 1.3)).normalize_or(aim.dir);
+                    }
+                    mark(spell, copy, element(spell).color() * grow * 0.8, 1.0, grow);
                 }
             }
             self.rune_marks.update(&mut self.renderer, dt, &marks);
@@ -4512,9 +4520,9 @@ impl Game {
                 r.2 += world_dt;
             }
             self.recent_runes.retain(|r| r.2 < COMBO_WINDOW);
-            let faded = self.runes.len();
+            let faded = self.runes.iter().filter(|r| !r.clone).count();
             self.runes.retain(|r| r.fuse > 0.0);
-            if self.runes.len() < faded {
+            if self.runes.iter().filter(|r| !r.clone).count() < faded {
                 self.notify("A rune fizzled out unused.");
             }
             let tap = self.input.pressed(KeyCode::AltLeft) && self.casting.is_none() && cast_done.is_none() && !self.menu_open;
@@ -4538,8 +4546,8 @@ impl Game {
                 // Spells that act on you (Recall Home, Shadow Step, Rift
                 // Gate, Arcane Clone...) aren't copied by arcane clones:
                 // repeating them would teleport you again, unlink a fresh
-                // rift gate or spawn clones from clones. Clones copy the
-                // planted spells when you set them off (see release_rune).
+                // rift gate or spawn clones from clones. Clones plant their
+                // own copies of planted spells instead (see set_rune).
                 self.cast_spell(spell);
                 self.spell_boost = 1.0;
                 if boost > 1.05 {
@@ -4549,10 +4557,6 @@ impl Game {
                 let after = self.cooldowns[spell.index()];
                 if after > before && after >= skill_cooldown(spell) - 1e-3 {
                     arm_echo(&mut self.echo_charges, &mut self.echo_repeat, spell, glam::Vec3::ZERO);
-                    // Summoning arcane clones isn't one of their five actions.
-                    if spell != Skill::ArcaneClone && self.clones.spend_action(&mut self.renderer) > 0 {
-                        self.notify("Your clone faded after its five actions.");
-                    }
                 }
             }
         }
@@ -4814,7 +4818,7 @@ impl Game {
                     overcharge: ((t - total) / OVERCHARGE_TIME).clamp(0.0, 1.0),
                     rune: rune_able(s),
                 }),
-                runes: self.runes.iter().map(|r| (r.spell.name().to_owned(), (r.fuse / RUNE_LIFE).clamp(0.0, 1.0), r.boost)).collect(),
+                runes: self.runes.iter().filter(|r| !r.clone).map(|r| (r.spell.name().to_owned(), (r.fuse / RUNE_LIFE).clamp(0.0, 1.0), r.boost)).collect(),
                 pending: if on_title { None } else { self.pending_prompt() },
             },
             on_title,

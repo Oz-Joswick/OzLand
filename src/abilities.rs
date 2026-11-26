@@ -494,7 +494,7 @@ impl Skill {
                 &[
                     rank(
                         "Arcane Clone",
-                        "SPELL. Call up a pair of violet clones, one either side of you, that copy every attack you make and your attack spells (Fireball, Meteor, Lightning, Blizzard, Missiles, Lance, Frost Nova), from where they stand. Each fades after 5 of your actions, or when drones destroy it.",
+                        "SPELL. Call up a pair of violet clones, one either side of you, that cast your spells with you: each plants its own rune where it stands, aimed at the same target, and they all go off when you cast yours. They don't fight. Each fades after 5 spells, or when drones destroy it.",
                     ),
                     rank("Arcane Coven", "A second pair, further out: four at once."),
                 ]

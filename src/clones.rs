@@ -8,9 +8,9 @@
 //!   [`formation`]), and turn as you turn. They last until destroyed or
 //!   dismissed.
 //! - **Arcane clones** (the Arcane Clone spell) glow violet and come in
-//!   pairs that stand either side of you, facing where you face, mirroring
-//!   every attack and spell you make from where they stand. Each fades
-//!   after five of your actions.
+//!   pairs that stand either side of you, facing where you face. When you
+//!   plant a spell each plants its own copy where it stands (they don't
+//!   fight). Each fades after five of your spells.
 //!
 //! Drones can destroy either kind.
 

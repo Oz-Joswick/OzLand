@@ -202,9 +202,11 @@ each other: fire and
 frost make a **Steam Burst**, storm and frost **Superconduct** (everything
 locked in place), fire and storm an **Overload** (a ring of explosions), and
 all three a **Cataclysm**. **Arcane Clone** (a spell) calls up a pair of violet
-clones, one either side of you, that mirror your casting and every attack
-from where they stand (Arcane Coven: a second pair); each fades after 5 of
-your actions. Ordinary clones (the
+clones, one either side of you, that cast your spells with you (Arcane
+Coven: a second pair): when you plant a spell each clone plants its own rune
+where it stands, aimed at the same target, and all of them go off when you
+press the key. They don't fight. Each fades after 5 spells (runes already
+planted stay). Ordinary clones (the
 Clone skill) just look like you and mirror your movement. Fire is Fireball and Meteor, frost Frost Nova and
 Blizzard, storm Chain Lightning, Arcane Lance and Arcane Missiles.
 

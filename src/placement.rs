@@ -46,54 +46,104 @@ pub struct GatePlan {
     pub invalid: bool,
 }
 
-/// Runes lying in the world: a glowing circle each, in its element's
-/// colour, spinning and pulsing faster as its fuse runs out.
+/// One spell circle in the world.
+#[derive(Clone, Copy)]
+pub struct RuneMark {
+    /// Its centre.
+    pub at: Vec3,
+    /// The way it faces: up for one lying on the ground, the spell's aim
+    /// for one standing up.
+    pub facing: Vec3,
+    pub color: Vec4,
+    /// Fuse left (1 full .. 0): it spins and pulses faster as it runs out.
+    pub left: f32,
+    /// Radius (m).
+    pub size: f32,
+}
+
+/// Spell circles lying in the world, drawn like the casting sigil round
+/// the crosshair: two rings with eight angular glyphs between them and a
+/// crossed core, in the spell's element colour.
 pub struct RuneMarks {
     group: usize,
     time: f32,
 }
 
+/// The casting sigil's glyphs (as in the HUD): strokes between points of a
+/// small compass (eight around, then the middle).
+const GLYPHS: [[usize; 6]; 8] = [
+    [0, 8, 4, 8, 2, 0], [6, 8, 1, 8, 5, 6], [0, 3, 6, 1, 4, 0], [2, 7, 4, 1, 6, 2],
+    [0, 5, 2, 7, 4, 1], [6, 3, 0, 2, 5, 7], [1, 4, 7, 3, 0, 6], [0, 2, 5, 1, 6, 4],
+];
+const POINTS: [(f32, f32); 9] = [
+    (0.0, -1.0), (0.7, -0.7), (1.0, 0.0), (0.7, 0.7),
+    (0.0, 1.0), (-0.7, 0.7), (-1.0, 0.0), (-0.7, -0.7), (0.0, 0.0),
+];
+
+/// The sigil, 1 m in radius, lying flat (facing +Y).
+fn sigil() -> MeshData {
+    let mut mesh = MeshData::default();
+    let mut line = |a: Vec3, b: Vec3, thick: f32| {
+        if a.distance(b) > 1e-4 {
+            mesh.push_cylinder(a, b - a, thick, a.distance(b), 5, Vec4::ONE, 1.0);
+        }
+    };
+    let around = |a: f32| Vec3::new(a.cos(), 0.0, a.sin());
+    // Outer and inner rings, and the core's ring.
+    for (radius, thick) in [(1.0, 0.026), (0.58, 0.02), (0.29, 0.022)] {
+        let segments = 40;
+        for k in 0..segments {
+            let a = |i: u32| i as f32 / segments as f32 * std::f32::consts::TAU;
+            line(around(a(k)) * radius, around(a(k + 1)) * radius, thick);
+        }
+    }
+    // Eight glyphs on a ring between them, each turned to face outwards.
+    for (i, glyph) in GLYPHS.iter().enumerate() {
+        let a = i as f32 * std::f32::consts::TAU / 8.0;
+        let (dir, right) = (around(a), Vec3::new(-a.sin(), 0.0, a.cos()));
+        let centre = dir * 0.79;
+        let map = |p: usize| centre + (dir * POINTS[p].0 + right * POINTS[p].1) * 0.13;
+        for pair in glyph.windows(2) {
+            line(map(pair[0]), map(pair[1]), 0.016);
+        }
+        line(centre - Vec3::Y * 0.02, centre + Vec3::Y * 0.02, 0.03);
+    }
+    // The crossed core.
+    let c = 0.29 * 0.55;
+    line(Vec3::new(-c, 0.0, c), Vec3::new(c, 0.0, -c), 0.024);
+    line(Vec3::new(-c, 0.0, -c), Vec3::new(c, 0.0, c), 0.018);
+    mesh
+}
+
 impl RuneMarks {
     pub fn new(renderer: &mut Renderer) -> Self {
-        // A flat ring 1 m across with a smaller ring inside and four spokes.
-        let mut ring = MeshData::default();
-        for (radius, thick) in [(1.0, 0.07), (0.62, 0.045)] {
-            let segments = 32;
-            for k in 0..segments {
-                let a = |i: u32| i as f32 / segments as f32 * std::f32::consts::TAU;
-                let p0 = Vec3::new(a(k).cos(), 0.0, a(k).sin()) * radius;
-                let p1 = Vec3::new(a(k + 1).cos(), 0.0, a(k + 1).sin()) * radius;
-                ring.push_cylinder(p0, p1 - p0, thick, p0.distance(p1), 5, Vec4::ONE, 1.0);
-            }
-        }
-        for k in 0..4 {
-            let a = k as f32 * std::f32::consts::FRAC_PI_2;
-            let d = Vec3::new(a.cos(), 0.0, a.sin());
-            ring.push_cylinder(d * 0.62, d, 0.035, 0.38, 5, Vec4::ONE, 1.0);
-        }
         let material = MaterialData { base_color: Vec4::ONE, ground_occlusion: 0.0, ..Default::default() };
-        let group = renderer.add_dynamic_group(&ring, &material, 48);
+        // Yours and four arcane clones', each with a target mark, for
+        // every spell you might have planted.
+        let group = renderer.add_dynamic_group(&sigil(), &material, 160);
         Self { group, time: 0.0 }
     }
 
-    /// Each circle: where, its colour, fuse left (1 full .. 0), and size (m).
-    pub fn update(&mut self, renderer: &mut Renderer, dt: f32, runes: &[(Vec3, Vec4, f32, f32)]) {
+    pub fn update(&mut self, renderer: &mut Renderer, dt: f32, marks: &[RuneMark]) {
         self.time += dt;
-        let marks: Vec<crate::renderer::Instance> = runes
+        let instances: Vec<crate::renderer::Instance> = marks
             .iter()
             .enumerate()
-            .map(|(i, &(at, color, left, size))| {
-                let urgency = 1.0 - left.clamp(0.0, 1.0);
-                let spin = Quat::from_rotation_y(self.time * (0.8 + urgency * 4.0) + i as f32);
-                let pulse = 1.0 + 0.08 * (self.time * (3.0 + urgency * 12.0)).sin();
+            .map(|(i, m)| {
+                let urgency = 1.0 - m.left.clamp(0.0, 1.0);
+                // Turn within its own plane (like the HUD sigil), then face
+                // the way it should.
+                let spin = Quat::from_rotation_y(self.time * (0.55 + urgency * 4.0) + i as f32);
+                let face = Quat::from_rotation_arc(Vec3::Y, m.facing.normalize_or(Vec3::Y));
+                let pulse = 1.0 + 0.06 * (self.time * (3.0 + urgency * 12.0)).sin();
                 let glow = 0.7 + 0.6 * urgency + 0.3 * (self.time * 6.0).sin().abs();
                 crate::renderer::Instance {
-                    transform: Mat4::from_scale_rotation_translation(Vec3::splat(size * pulse), spin, at + Vec3::Y * 0.12),
-                    tint: Vec4::new(color.x * glow, color.y * glow, color.z * glow, 1.0),
+                    transform: Mat4::from_scale_rotation_translation(Vec3::splat(m.size * pulse), face * spin, m.at),
+                    tint: Vec4::new(m.color.x * glow, m.color.y * glow, m.color.z * glow, 1.0),
                 }
             })
             .collect();
-        renderer.set_instances(self.group, &marks);
+        renderer.set_instances(self.group, &instances);
     }
 }
 

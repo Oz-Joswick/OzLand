@@ -131,7 +131,7 @@ impl Tutorial {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
 
     #[test]
     fn steps_finish_by_doing_them_in_order() {
